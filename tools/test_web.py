@@ -20,14 +20,13 @@ BLE_STUB = r"""
     telemetryCount: 0,
     telemetryDelayMs: 0,
     telemetryUnsupported: false,
-    setupDone: false,
     slots: [
       { n: 1, name: '主卡', num: '13800138000', reg: true, op: '中国移动', csq: 23 },
       { n: 2, name: '备用卡', num: '卡2-123456', reg: false, op: '', csq: null }
     ],
     wifi: { ssid: 'Studio', cfg_ssid: 'Studio', ip: '192.168.1.40', cfg_ip: '192.168.1.40',
       mask: '255.255.255.0', gw: '192.168.1.1', dns: '223.5.5.5', dhcp: false, rssi: -51, up: 7200 },
-    fs: { state: 'online', configured: true, app_id: 'cli_initial' },
+    fs: { state: 'offline', configured: true, app_id: 'cli_initial' },
     tz: 8
   };
   class Char extends EventTarget {
@@ -46,7 +45,7 @@ BLE_STUB = r"""
       let reply;
       if (state.failNext) { const err = state.failNext; state.failNext = null; reply = { id: req.id, ok: false, err }; }
       else if (req.cmd === 'status') reply = { id: req.id, ok: true, data: {
-        setup_done: state.setupDone, slots: state.slots, wifi: state.wifi, feishu: state.fs,
+        slots: state.slots, wifi: state.wifi, feishu: state.fs,
         time: { synced: true, utc: 1763900000, tz: state.tz }
       }};
       else if (req.cmd === 'telemetry') {
@@ -202,7 +201,7 @@ def test_lan_mode(browser) -> None:
         assert page.get_by_text("LAN 主卡", exact=True).is_visible()
         assert page.locator("#lanGate").is_hidden()
         assert page.locator("#btnConnect").is_hidden()
-        assert page.locator("#provisionGuide").is_hidden()
+        assert page.locator("#setupGuide").is_hidden()
         if "token=" in page.url:
             raise AssertionError("management token remained in URL")
         assert page.evaluate("sessionStorage.length") == 1
@@ -322,9 +321,11 @@ def test_factory_reset(page, server) -> None:
     assert page.evaluate("sessionStorage.length") == 0
 
 
-def test_ble_provision_guide(page) -> None:
-    title = page.locator("#provisionTitle")
-    assert title.inner_text() == "接下来使用局域网管理"
+def test_ble_setup_guide(page) -> None:
+    title = page.locator("#setupTitle")
+    guidance = page.locator("#setupText")
+    assert title.inner_text() == "等待飞书上线"
+    assert "自动关闭蓝牙" in guidance.inner_text()
     page.evaluate("""() => {
         const {wifi, fs} = window.mockBle;
         window.savedWifi = {...wifi};
@@ -333,15 +334,14 @@ def test_ble_provision_guide(page) -> None:
         return refresh();
     }""")
     assert title.inner_text() == "连接 Wi-Fi"
+    assert "保存并连接" in guidance.inner_text()
     page.evaluate("window.mockBle.wifi = window.savedWifi; window.mockBle.fs.configured = false; refresh()")
     assert title.inner_text() == "配置飞书"
-    page.evaluate("window.mockBle.fs.configured = true; window.mockBle.fs.state = 'offline'; refresh()")
-    assert title.inner_text() == "等待飞书上线"
-    page.evaluate("window.mockBle.setupDone = true; refresh()")
-    assert title.inner_text() == "蓝牙恢复配置"
-    assert "120 秒" in page.locator("#provisionText").inner_text()
-    page.evaluate("window.mockBle.setupDone = false; window.mockBle.fs = window.savedFs; refresh()")
+    assert "保存飞书配置" in guidance.inner_text()
+    page.evaluate("window.mockBle.fs.configured = true; window.mockBle.fs.state = 'online'; refresh()")
     assert title.inner_text() == "接下来使用局域网管理"
+    assert "/web" in guidance.inner_text()
+    page.evaluate("window.mockBle.fs = window.savedFs; refresh()")
 
 
 def test_ble_monitor(page) -> None:
@@ -400,6 +400,7 @@ def main() -> None:
             assert page.locator("#heading-network").count() == 1
             assert page.locator("#view-network").is_hidden()
             assert page.locator("#btnSaveWifi").is_disabled()
+            assert "USB 控制台" in page.locator("#setupText").inner_text()
 
             page.get_by_role("button", name="连接设备").click()
             page.get_by_text("主卡", exact=True).wait_for()
@@ -411,15 +412,15 @@ def main() -> None:
             assert page.locator("#view-overview").is_visible()
             assert page.locator("#view-network").is_hidden()
             test_ble_monitor(page)
-            test_ble_provision_guide(page)
+            test_ble_setup_guide(page)
 
             page.get_by_role("button", name="网络", exact=True).click()
             assert page.locator("#view-network").is_visible()
             page.locator("#ssid").fill("Studio-5G")
             page.locator("#pass").fill("example-secret")
-            page.evaluate("window.mockBle.failNext='physical_presence_required'")
+            page.evaluate("window.mockBle.failNext='save_failed'")
             page.get_by_role("button", name="保存并连接").click()
-            page.get_by_text("按设备 BOOT 键", exact=False).wait_for()
+            page.get_by_text("save_failed", exact=True).wait_for()
             page.evaluate("refresh()")
             assert page.locator("#pass").input_value() == "example-secret"
             assert page.locator("#ssid").input_value() == "Studio-5G"

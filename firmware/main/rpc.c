@@ -233,13 +233,6 @@ static esp_err_t error_reply(int id, const char *err, char *out, size_t out_len)
     return result;
 }
 
-static bool mutating_command(const char *cmd)
-{
-    return !strcmp(cmd, "wifi_set") || !strcmp(cmd, "feishu_set") ||
-           !strcmp(cmd, "slot_set") || !strcmp(cmd, "tz_set") ||
-           !strcmp(cmd, "reboot");
-}
-
 static bool explicit_reset_confirmation(cJSON *request)
 {
     bool confirmed = false;
@@ -289,13 +282,13 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
 
     if (factory_reset_pending()) {
         err = "reset_pending";
+    } else if (via_ble && cfg_setup_done()) {
+        err = "setup_complete";
     } else if (!strcmp(cmd, "factory_reset")) {
         if (via_ble) err = "lan_required";
         else if (!explicit_reset_confirmation(root)) err = "confirm_required";
         else if (factory_reset_request() != ESP_OK) err = "reset_storage_failed";
         else *post_action = RPC_POST_RESTART;
-    } else if (via_ble && mutating_command(cmd) && !ble_physical_presence_active()) {
-        err = "physical_presence_required";
     } else if (!strcmp(cmd, "status")) {
         data = status_data();
         if (data && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "telemetry"))) {

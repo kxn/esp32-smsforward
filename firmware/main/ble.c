@@ -2,15 +2,12 @@
 #include "rpc.h"
 #include "cfg.h"
 #include "ble_lifecycle_policy.h"
-#include "board.h"
-#include "driver/gpio.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 #include "esp_log.h"
-#include "esp_attr.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -48,15 +45,9 @@ static char s_rx[513];
 static size_t s_rx_len;
 static uint16_t s_rx_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint32_t s_rx_generation;
-static int64_t s_provision_until_ms;
-static volatile int64_t s_ble_last_activity_ms;
-static TaskHandle_t s_boot_button_task_handle;
-static volatile bool s_boot_irq_ready;
 static TaskHandle_t s_lifecycle_task_handle;
 static TaskHandle_t s_cmd_task_handle;
-static TaskHandle_t s_idle_task_handle;
 static volatile bool s_host_running;
-static volatile bool s_host_shutting_down;
 static bool s_nimble_host_stopped;
 static unsigned s_cmd_pending;
 static portMUX_TYPE s_lifecycle_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -64,111 +55,14 @@ static portMUX_TYPE s_lifecycle_mux = portMUX_INITIALIZER_UNLOCKED;
 #define BLE_STOP_DRAIN_MS 30000
 #define BLE_STOP_CONN_MS 2000
 
-#define BLE_IDLE_TIMEOUT_MS 45000
-
-static bool ble_host_allowed(void);
-
-static void ble_idle_watchdog(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        int64_t now = esp_timer_get_time() / 1000;
-        uint16_t conn = s_conn;
-        if (ble_host_allowed() && conn != BLE_HS_CONN_HANDLE_NONE && s_ble_last_activity_ms > 0 &&
-            now - s_ble_last_activity_ms > BLE_IDLE_TIMEOUT_MS) {
-            if (ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM) == 0) {
-                ESP_LOGI(TAG, "closed idle BLE connection");
-                s_ble_last_activity_ms = 0;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-}
-
-bool ble_physical_presence_active(void)
-{
-    int64_t now = esp_timer_get_time() / 1000;
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    int64_t deadline = s_provision_until_ms;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
-    return now < deadline;
-}
-
-static int64_t provision_deadline_ms(void)
-{
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    int64_t deadline = s_provision_until_ms;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
-    return deadline;
-}
-
 static bool ble_host_allowed(void)
 {
-    return !s_host_shutting_down && (!cfg_setup_done() || ble_physical_presence_active());
-}
-
-void ble_provision_open(void)
-{
-    int64_t deadline = esp_timer_get_time() / 1000 + 120000;
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    s_provision_until_ms = deadline;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
-    ESP_LOGI(TAG, "local provisioning window opened");
-    if (s_lifecycle_task_handle) xTaskNotifyGive(s_lifecycle_task_handle);
+    return ble_lifecycle_should_run(cfg_setup_done());
 }
 
 void ble_lockdown(void)
 {
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    s_provision_until_ms = 0;
-    s_host_shutting_down = true;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
-    ESP_LOGI(TAG, "BLE provisioning closed after setup completion");
     if (s_lifecycle_task_handle) xTaskNotifyGive(s_lifecycle_task_handle);
-}
-
-static void IRAM_ATTR boot_button_isr(void *arg)
-{
-    (void)arg;
-    BaseType_t higher_priority_woken = pdFALSE;
-    TaskHandle_t task = s_boot_button_task_handle;
-    if (task && s_boot_irq_ready) {
-        vTaskNotifyGiveFromISR(task, &higher_priority_woken);
-    }
-    if (higher_priority_woken) portYIELD_FROM_ISR();
-}
-
-static void boot_button_task(void *arg)
-{
-    (void)arg;
-    /* Main signals once after IRQ setup is complete; this avoids racing task
-     * startup against s_boot_irq_ready and accidentally entering fallback. */
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if (!s_boot_irq_ready) {
-        ESP_LOGW(TAG, "BOOT GPIO interrupt unavailable; using 40 ms polling fallback");
-        bool was_down = false;
-        for (;;) {
-            bool down = gpio_get_level(PIN_BOOT) == 0;
-            if (down && !was_down) ble_provision_open();
-            was_down = down;
-            vTaskDelay(pdMS_TO_TICKS(40));
-        }
-    }
-
-    bool was_down = false;
-    if (gpio_get_level(PIN_BOOT) == 0) {
-        ble_provision_open();
-        was_down = true;
-    }
-    for (;;) {
-        /* The ISR only wakes this task. Debounce in task context and grant
-         * provisioning on a stable press edge, including boot-held-low. */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        bool down = gpio_get_level(PIN_BOOT) == 0;
-        if (down && !was_down) ble_provision_open();
-        was_down = down;
-    }
 }
 
 static void advertise(void);
@@ -204,7 +98,7 @@ static bool command_pending_add(void)
 {
     bool accepted;
     taskENTER_CRITICAL(&s_lifecycle_mux);
-    accepted = !s_host_shutting_down;
+    accepted = ble_host_allowed();
     if (accepted) s_cmd_pending++;
     taskEXIT_CRITICAL(&s_lifecycle_mux);
     return accepted;
@@ -223,6 +117,11 @@ static void ble_cmd_task(void *arg)
     ble_cmd_t job;
     while (1) {
         if (xQueueReceive(s_cmd_q, &job, portMAX_DELAY) != pdTRUE || !job.json) continue;
+        if (!ble_host_allowed()) {
+            free(job.json);
+            command_pending_done();
+            continue;
+        }
         char *response = malloc(4096);
         rpc_post_reply_action_t action = RPC_POST_NONE;
         if (response && rpc_dispatch_json(job.json, response, 4096, true, &action) == ESP_OK) {
@@ -247,7 +146,6 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
     if (!ble_host_allowed()) return BLE_ATT_ERR_UNLIKELY;
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        s_ble_last_activity_ms = esp_timer_get_time() / 1000;
         if (s_rx_len && (s_rx_conn != conn_handle || s_rx_generation != s_conn_generation)) {
             s_rx_len = 0;
             s_rx_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -290,7 +188,6 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        s_ble_last_activity_ms = esp_timer_get_time() / 1000;
         const char *p = "smsfwd";
         int rc = os_mbuf_append(ctxt->om, p, strlen(p));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -358,7 +255,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         s_conn = (event->connect.status == 0) ? event->connect.conn_handle : BLE_HS_CONN_HANDLE_NONE;
         s_conn_generation++;
-        s_ble_last_activity_ms = (s_conn != BLE_HS_CONN_HANDLE_NONE) ? esp_timer_get_time() / 1000 : 0;
         ESP_LOGI(TAG, "connect status=%d", event->connect.status);
         if (!ble_host_allowed() && s_conn != BLE_HS_CONN_HANDLE_NONE) {
             (void)ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -367,7 +263,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         s_conn = BLE_HS_CONN_HANDLE_NONE;
         s_conn_generation++;
-        s_ble_last_activity_ms = 0;
         s_rx_len = 0;
         s_rx_conn = BLE_HS_CONN_HANDLE_NONE;
         s_rx_generation = s_conn_generation;
@@ -376,9 +271,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         if (ble_host_allowed()) advertise();
-        return 0;
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        s_ble_last_activity_ms = esp_timer_get_time() / 1000;
         return 0;
     default:
         return 0;
@@ -415,10 +307,6 @@ static void advertise(void)
 static esp_err_t ble_host_start(void)
 {
     if (s_host_running) return ESP_OK;
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    s_host_shutting_down = false;
-    s_cmd_pending = 0;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
     s_nimble_host_stopped = false;
 
     esp_err_t err = rpc_init();
@@ -457,13 +345,6 @@ static esp_err_t ble_host_start(void)
         err = ESP_ERR_NO_MEM;
         goto fail_nimble;
     }
-    if (xTaskCreate(ble_idle_watchdog, "ble_idle", 2048, NULL, 3,
-                    &s_idle_task_handle) != pdPASS) {
-        vTaskDelete(s_cmd_task_handle);
-        s_cmd_task_handle = NULL;
-        err = ESP_ERR_NO_MEM;
-        goto fail_nimble;
-    }
 
     nimble_port_freertos_init(host_task);
     s_host_running = true;
@@ -482,9 +363,6 @@ static esp_err_t ble_host_stop(void)
 {
     if (!s_host_running) return ESP_OK;
 
-    taskENTER_CRITICAL(&s_lifecycle_mux);
-    s_host_shutting_down = true;
-    taskEXIT_CRITICAL(&s_lifecycle_mux);
     (void)ble_gap_adv_stop();
 
     uint16_t conn = s_conn;
@@ -508,10 +386,6 @@ static esp_err_t ble_host_stop(void)
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    if (s_idle_task_handle) {
-        vTaskDelete(s_idle_task_handle);
-        s_idle_task_handle = NULL;
-    }
     if (s_cmd_task_handle) {
         vTaskDelete(s_cmd_task_handle);
         s_cmd_task_handle = NULL;
@@ -549,9 +423,7 @@ static void ble_lifecycle_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        bool setup_done = cfg_setup_done();
-        bool window_active = ble_physical_presence_active();
-        bool should_run = ble_lifecycle_should_run(setup_done, window_active);
+        bool should_run = ble_host_allowed();
 
         bool retry = false;
         if (should_run && !s_host_running) {
@@ -568,14 +440,7 @@ static void ble_lifecycle_task(void *arg)
             }
         }
 
-        TickType_t wait_ticks = portMAX_DELAY;
-        if (retry) {
-            wait_ticks = pdMS_TO_TICKS(1000);
-        } else if (cfg_setup_done() && ble_physical_presence_active()) {
-            int64_t remaining = provision_deadline_ms() - esp_timer_get_time() / 1000;
-            wait_ticks = remaining > 0 ? pdMS_TO_TICKS(remaining) : 0;
-        }
-        (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
+        (void)ulTaskNotifyTake(pdTRUE, retry ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
     }
 }
 
@@ -583,31 +448,6 @@ esp_err_t ble_start(void)
 {
     esp_err_t rpc_err = rpc_init();
     if (rpc_err != ESP_OK) return rpc_err;
-
-    gpio_config_t boot = { .pin_bit_mask = 1ULL << PIN_BOOT, .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE };
-    esp_err_t gpio_err = gpio_config(&boot);
-    if (gpio_err != ESP_OK) ESP_LOGW(TAG, "BOOT GPIO config failed: %s", esp_err_to_name(gpio_err));
-    if (xTaskCreate(boot_button_task, "ble_button", 2048, NULL, 3,
-                    &s_boot_button_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "BOOT task creation failed; physical BLE provisioning unavailable");
-        s_boot_button_task_handle = NULL;
-    } else if (gpio_err == ESP_OK) {
-        gpio_err = gpio_install_isr_service(0);
-        if (gpio_err == ESP_ERR_INVALID_STATE) gpio_err = ESP_OK;
-        if (gpio_err == ESP_OK) gpio_err = gpio_isr_handler_add(PIN_BOOT, boot_button_isr, NULL);
-        if (gpio_err == ESP_OK) gpio_err = gpio_set_intr_type(PIN_BOOT, GPIO_INTR_ANYEDGE);
-        if (gpio_err == ESP_OK) {
-            s_boot_irq_ready = true;
-            ESP_LOGI(TAG, "BOOT edge wake enabled");
-        } else {
-            ESP_LOGW(TAG, "BOOT edge wake setup failed: %s", esp_err_to_name(gpio_err));
-            (void)gpio_isr_handler_remove(PIN_BOOT);
-            (void)gpio_set_intr_type(PIN_BOOT, GPIO_INTR_DISABLE);
-        }
-    }
-    if (s_boot_button_task_handle) xTaskNotifyGive(s_boot_button_task_handle);
 
     if (xTaskCreate(ble_lifecycle_task, "ble_lifecycle", 4096, NULL, 4,
                     &s_lifecycle_task_handle) != pdPASS) {
@@ -621,5 +461,5 @@ esp_err_t ble_start(void)
 
 bool ble_connected(void)
 {
-    return s_conn != BLE_HS_CONN_HANDLE_NONE;
+    return ble_host_allowed() && s_conn != BLE_HS_CONN_HANDLE_NONE;
 }

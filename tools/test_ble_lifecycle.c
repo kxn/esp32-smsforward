@@ -6,18 +6,17 @@
 int main(void)
 {
     /* Fresh and legacy devices remain provisionable until both are online. */
-    assert(ble_lifecycle_should_run(false, false));
-    assert(ble_lifecycle_can_complete(false, false, false) == false);
-    assert(ble_lifecycle_can_complete(false, true, false) == false);
-    assert(ble_lifecycle_can_complete(false, false, true) == false);
+    assert(ble_lifecycle_should_run(false));
+    assert(!ble_lifecycle_can_complete(false, false, false));
+    assert(!ble_lifecycle_can_complete(false, true, false));
+    assert(!ble_lifecycle_can_complete(false, false, true));
     assert(ble_lifecycle_can_complete(false, true, true));
 
-    /* Completed devices stay off across outages/reboots, unless physical
-     * presence explicitly opens the recovery window. */
-    assert(!ble_lifecycle_should_run(true, false));
+    /* Persisted completion keeps BLE off even if either service goes offline. */
+    assert(!ble_lifecycle_should_run(true));
+    assert(!ble_lifecycle_can_complete(true, false, false));
     assert(!ble_lifecycle_can_complete(true, true, true));
-    assert(ble_lifecycle_should_run(true, true));
 
-    puts("BLE setup completion and physical recovery policy passed");
+    puts("BLE setup lifecycle policy passed");
     return 0;
 }

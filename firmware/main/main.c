@@ -271,17 +271,6 @@ static void net_task(void *arg)
         }
         if (had_ip != has_ip) fs_retry_at = 0;
         had_ip = has_ip;
-        if (has_ip && !lan_started && now >= lan_start_retry_at) {
-            esp_err_t web_err = lan_web_start();
-            if (web_err == ESP_OK) {
-                lan_started = true;
-                lan_start_retry_ms = 1000;
-            } else {
-                ESP_LOGW(TAG, "LAN management server start deferred (%s)", esp_err_to_name(web_err));
-                lan_start_retry_at = now + lan_start_retry_ms;
-                lan_start_retry_ms = lan_start_retry_ms < 15000 ? lan_start_retry_ms * 2 : 30000;
-            }
-        }
         if (cfg->wifi_ssid[0] && !wifi_config_applied() && now >= wifi_start_retry_at) {
             esp_err_t e = wifi_start(cfg);
             if (e == ESP_OK) {
@@ -303,6 +292,17 @@ static void net_task(void *arg)
             rpc_complete_setup()) {
             ESP_LOGI(TAG, "Wi-Fi and authenticated Feishu websocket are online; closing BLE setup");
             ble_lockdown();
+        }
+        if (has_ip && !lan_started && now >= lan_start_retry_at) {
+            esp_err_t web_err = lan_web_start();
+            if (web_err == ESP_OK) {
+                lan_started = true;
+                lan_start_retry_ms = 1000;
+            } else {
+                ESP_LOGW(TAG, "LAN management server start deferred (%s)", esp_err_to_name(web_err));
+                lan_start_retry_at = now + lan_start_retry_ms;
+                lan_start_retry_ms = lan_start_retry_ms < 15000 ? lan_start_retry_ms * 2 : 30000;
+            }
         }
         if (online && !was_online) sms_retry_pending();
         was_online = online;

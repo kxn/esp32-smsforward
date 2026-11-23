@@ -429,14 +429,14 @@
         color: var(--muted);
         font-size: 12px;
       }
-      .provision-guide {
+      .setup-guide {
         margin-bottom: 18px;
         padding: 12px 15px;
         border: 1px solid #d7dfd5;
         border-radius: 12px;
         background: #f2f5ee;
       }
-      .provision-guide p {
+      .setup-guide p {
         margin: 3px 0 0;
         color: var(--muted);
         font-size: 13px;
@@ -812,9 +812,9 @@
         <button type="button" data-view="slots">卡槽</button>
         <button type="button" data-view="system">系统</button>
       </nav>
-      <aside class="provision-guide" id="provisionGuide" aria-labelledby="provisionTitle">
-        <strong id="provisionTitle">蓝牙配置</strong>
-        <p id="provisionText"></p>
+      <aside class="setup-guide" id="setupGuide" aria-labelledby="setupTitle">
+        <strong id="setupTitle">首次配置</strong>
+        <p id="setupText"></p>
       </aside>
 
       <section
@@ -1213,9 +1213,7 @@
         t._h = setTimeout(() => (t.className = ""), 3300);
       }
       function deviceError(msg) {
-        return msg === "physical_presence_required"
-          ? "按设备 BOOT 键，或在 USB 控制台输入 provision，再于 2 分钟内重试"
-          : msg || "设备操作失败";
+        return msg || "设备操作失败";
       }
       function setConn(on) {
         S.connected = on;
@@ -1227,7 +1225,7 @@
         for (const b of document.querySelectorAll("[data-device-action]"))
           b.disabled = !on;
         updateFactoryControl();
-        renderProvisionGuide();
+        renderSetupGuide();
         if (on) {
           startStatusTimer();
           $("overviewSub").textContent = "正在读取状态";
@@ -1434,7 +1432,7 @@
         $("lanGate").hidden = false;
         for (const b of document.querySelectorAll("[data-device-action]")) b.disabled = true;
         updateFactoryControl();
-        renderProvisionGuide();
+        renderSetupGuide();
       }
       function clearLanToken() {
         S.lanToken = "";
@@ -1721,32 +1719,29 @@
           )
           .join("");
       }
-      function renderProvisionGuide(data = {}) {
-        const guide = $("provisionGuide");
+      function renderSetupGuide(data = {}) {
+        const guide = $("setupGuide");
         guide.hidden = S.transport !== "ble";
         if (guide.hidden) return;
-        let title = "蓝牙配置";
-        let text = "首次使用请选择设备。若设备已连上 Wi-Fi 和飞书，发布应用后在机器人私聊发送 /help，再发 /web。需要恢复蓝牙时，短按 BOOT 后在 120 秒内重连。";
-        if (S.connected && data.setup_done) {
-          title = "蓝牙恢复配置";
-          text = "短按 BOOT 后，蓝牙可用 120 秒。保存需要修正的设置，再回飞书私聊发送 /web 打开局域网管理。";
-        } else if (S.connected && data.wifi && data.feishu) {
+        let title = "首次配置";
+        let text = "选择设备后配置 Wi-Fi 和飞书。已完成首次配置的设备，可在机器人私聊发送 /web 打开局域网管理页，离线时可用 USB 控制台修改设置。";
+        if (S.connected && data.wifi && data.feishu) {
           if (!data.wifi.ip) {
             title = "连接 Wi-Fi";
-            text = "在「网络」填写 Wi-Fi 名称和密码，短按设备 BOOT 后保存。";
+            text = "在「网络」填写 Wi-Fi 名称和密码，点击「保存并连接」。";
           } else if (!data.feishu.configured) {
             title = "配置飞书";
-            text = "在「飞书」填写同一应用的 App ID 和 App Secret，短按 BOOT 后保存。";
+            text = "在「飞书」填写同一应用的 App ID 和 App Secret，点击「保存飞书配置」。";
           } else if (data.feishu.state !== "online") {
             title = "等待飞书上线";
-            text = "Wi-Fi 和飞书都连通后，设备会自动关闭蓝牙。完成飞书应用发布后，在机器人私聊发送 /help，再发 /web。";
+            text = "飞书长连接上线后，设备会自动关闭蓝牙。发布飞书应用后，在机器人私聊发送 /help，再发 /web。";
           } else {
             title = "接下来使用局域网管理";
             text = "蓝牙将自动关闭。发布飞书应用后，在机器人私聊发送 /help 完成绑定，再发送 /web 打开链接。";
           }
         }
-        if ($("provisionTitle").textContent !== title) $("provisionTitle").textContent = title;
-        if ($("provisionText").textContent !== text) $("provisionText").textContent = text;
+        if ($("setupTitle").textContent !== title) $("setupTitle").textContent = title;
+        if ($("setupText").textContent !== text) $("setupText").textContent = text;
       }
       function renderStatus(msg) {
         const d = msg.data || {},
@@ -1754,7 +1749,7 @@
           wifi = d.wifi || {},
           fs = d.feishu || {},
           time = d.time || {};
-        renderProvisionGuide(d);
+        renderSetupGuide(d);
         renderSlot(0, slots[0]);
         renderSlot(1, slots[1]);
         $("overviewSub").textContent =

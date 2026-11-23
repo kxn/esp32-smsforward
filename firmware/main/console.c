@@ -7,7 +7,6 @@
 #include "feishu.h"
 #include "cfg.h"
 #include "wifi.h"
-#include "ble.h"
 #include "modem_timing.h"
 #include "power_policy.h"
 
@@ -337,7 +336,8 @@ static void cmd_help(void)
            "m1 <AT>         向模组1发 AT\n"
            "m2 <AT>         向模组2发 AT\n"
            "p1 / p2 / pa    探活序列（pa=两张卡）\n"
-           "provision       BLE 配置窗口 120s\n"
+           "wifi <ssid> <pass>        设置 Wi-Fi\n"
+           "fset <app_id> <app_secret> 设置飞书应用\n"
            "r1 / r2         硬件复位模组\n"
            "sms1 <num> <txt> 用模组1发短信（后续版本）\n"
            "\n");
@@ -385,9 +385,6 @@ static void handle_line(char *line)
         cmd_wifi(line + 5);
     } else if (!strcmp(line, "net")) {
         cmd_net();
-    } else if (!strcmp(line, "provision")) {
-        ble_provision_open();
-        printf("\nBLE provisioning open for 120s\n");
     } else if (!strcmp(line, "save")) {
         cfg_save();
         printf("\nsaved\n");
