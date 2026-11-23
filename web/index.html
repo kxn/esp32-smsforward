@@ -1,0 +1,1777 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#f4f3ed" />
+    <title>短信转发 · SMSF</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #f4f3ed;
+        --surface: #fffefa;
+        --ink: #182822;
+        --muted: #68766f;
+        --line: #dedfd6;
+        --pine: #176453;
+        --pine-dark: #124e42;
+        --pine-wash: #e8f1ed;
+        --amber: #a05c19;
+        --amber-wash: #f8eedf;
+        --red: #a4413a;
+        --red-wash: #f8e9e6;
+        --shadow: 0 10px 32px #263b2d0a;
+        --radius: 18px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        min-width: 320px;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font:
+          15px/1.55 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          system-ui,
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      button,
+      input {
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled,
+      input:disabled {
+        cursor: not-allowed;
+        opacity: 0.52;
+      }
+      :focus-visible {
+        outline: 3px solid #3389747a;
+        outline-offset: 3px;
+      }
+      .topbar {
+        height: 68px;
+        background: #fbfaf6;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+      }
+      .top-inner {
+        width: min(1120px, 100%);
+        margin: auto;
+        padding: 0 28px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+      .identity {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+      .mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 11px;
+        background: var(--pine);
+        color: white;
+        display: grid;
+        place-items: center;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: -0.06em;
+      }
+      .product {
+        font-size: 14px;
+        font-weight: 750;
+        letter-spacing: 0.01em;
+      }
+      .device-name {
+        display: block;
+        max-width: 240px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 450;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .connection {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .connection-state {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .lamp {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9ba39d;
+      }
+      .lamp.on {
+        background: var(--pine);
+        box-shadow: 0 0 0 4px #1764531c;
+      }
+      .button {
+        min-height: 40px;
+        padding: 9px 15px;
+        border: 1px solid #cfd5cc;
+        border-radius: 10px;
+        background: var(--surface);
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 700;
+        transition:
+          background 0.15s,
+          border-color 0.15s,
+          transform 0.15s;
+      }
+      .button:hover:not(:disabled) {
+        background: #f3f5ef;
+        border-color: #aebdb2;
+      }
+      .button:active:not(:disabled) {
+        transform: translateY(1px);
+      }
+      .button-primary {
+        background: var(--pine);
+        border-color: var(--pine);
+        color: #fff;
+      }
+      .button-primary:hover:not(:disabled) {
+        background: var(--pine-dark);
+        border-color: var(--pine-dark);
+      }
+      .button-quiet {
+        background: transparent;
+      }
+      .button-danger {
+        color: var(--red);
+        border-color: #e5c5c0;
+      }
+      .button-small {
+        min-height: 36px;
+        padding: 7px 12px;
+      }
+      main {
+        width: min(1120px, 100%);
+        min-height: calc(100vh - 68px);
+        margin: auto;
+        padding: 28px 28px 64px;
+      }
+      .nav {
+        display: flex;
+        gap: 6px;
+        border-bottom: 1px solid var(--line);
+        overflow-x: auto;
+        scrollbar-width: thin;
+        margin-bottom: 30px;
+      }
+      .nav button {
+        flex: 0 0 auto;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        background: transparent;
+        padding: 10px 14px 12px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .nav button[aria-current="page"] {
+        color: var(--pine-dark);
+        border-color: var(--pine);
+        font-weight: 750;
+      }
+      .nav button:hover {
+        color: var(--ink);
+      }
+      .view[hidden] {
+        display: none;
+      }
+      .view-head {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 18px;
+        margin: 0 0 22px;
+      }
+      .eyebrow {
+        margin: 0 0 5px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 750;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+      .view h1 {
+        margin: 0;
+        font-size: clamp(25px, 4vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.045em;
+        font-weight: 760;
+      }
+      .view-sub {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .section-title {
+        margin: 0 0 13px;
+        font-size: 14px;
+        font-weight: 750;
+        letter-spacing: -0.01em;
+      }
+      .sim-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .sim-card,
+      .panel,
+      .network-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+      }
+      .sim-card {
+        padding: 21px 22px 19px;
+        min-width: 0;
+      }
+      .sim-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .slot-name {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 740;
+        letter-spacing: -0.02em;
+        overflow-wrap: anywhere;
+      }
+      .sim-index {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+      .reg-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border-radius: 999px;
+        padding: 5px 9px;
+        background: #eef0ec;
+        color: #66736c;
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .reg-pill::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #929b94;
+      }
+      .reg-pill.yes {
+        background: var(--pine-wash);
+        color: var(--pine-dark);
+      }
+      .reg-pill.yes::before {
+        background: var(--pine);
+      }
+      .reg-pill.no {
+        background: var(--amber-wash);
+        color: var(--amber);
+      }
+      .reg-pill.no::before {
+        background: #bd751e;
+      }
+      .phone {
+        margin: 24px 0 17px;
+        font-size: 25px;
+        font-weight: 720;
+        letter-spacing: -0.035em;
+        font-variant-numeric: tabular-nums;
+        overflow-wrap: anywhere;
+      }
+      .phone.unknown {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--muted);
+        letter-spacing: 0;
+      }
+      .sim-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        border-top: 1px solid #e9e9e1;
+        padding-top: 13px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .carrier {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #405148;
+        font-weight: 600;
+      }
+      .signal {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        white-space: nowrap;
+      }
+      .signal strong {
+        color: var(--ink);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      .signal-bars {
+        height: 15px;
+        display: flex;
+        align-items: flex-end;
+        gap: 2px;
+      }
+      .signal-bars i {
+        width: 3px;
+        border-radius: 2px;
+        background: #d0d7cf;
+      }
+      .signal-bars i:nth-child(1) {
+        height: 5px;
+      }
+      .signal-bars i:nth-child(2) {
+        height: 8px;
+      }
+      .signal-bars i:nth-child(3) {
+        height: 11px;
+      }
+      .signal-bars i:nth-child(4) {
+        height: 15px;
+      }
+      .signal-bars[data-level="1"] i:nth-child(-n + 1),
+      .signal-bars[data-level="2"] i:nth-child(-n + 2),
+      .signal-bars[data-level="3"] i:nth-child(-n + 3),
+      .signal-bars[data-level="4"] i {
+        background: var(--pine);
+      }
+      .network-section {
+        margin-top: 31px;
+      }
+      .network-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .network-card {
+        padding: 16px 17px;
+        min-width: 0;
+        box-shadow: none;
+      }
+      .network-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 750;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .network-value {
+        margin-top: 8px;
+        font-size: 15px;
+        font-weight: 720;
+        overflow-wrap: anywhere;
+      }
+      .network-detail {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      .state-good {
+        color: var(--pine-dark);
+      }
+      .state-warn {
+        color: var(--amber);
+      }
+      .state-bad {
+        color: var(--red);
+      }
+      .panel {
+        padding: 22px;
+        box-shadow: none;
+      }
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 18px;
+      }
+      .field {
+        min-width: 0;
+      }
+      .field-wide {
+        grid-column: 1/-1;
+      }
+      label {
+        display: block;
+        margin: 14px 0 6px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #47564e;
+      }
+      label:first-child {
+        margin-top: 0;
+      }
+      .input {
+        width: 100%;
+        min-height: 43px;
+        border: 1px solid #cfd5cc;
+        border-radius: 10px;
+        background: #fffefa;
+        padding: 10px 12px;
+        color: var(--ink);
+        font-size: 14px;
+        transition:
+          border-color 0.15s,
+          box-shadow 0.15s;
+      }
+      .input::placeholder {
+        color: #a0a8a0;
+      }
+      .input:focus {
+        outline: none;
+        border-color: #4f8d7b;
+        box-shadow: 0 0 0 3px #1764531c;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .row .input {
+        min-width: 0;
+      }
+      .switch {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        margin-top: 14px;
+        font-size: 13px;
+        color: #34463d;
+      }
+      .switch input {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        accent-color: var(--pine);
+      }
+      .hidden {
+        display: none !important;
+      }
+      .actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 9px;
+        flex-wrap: wrap;
+        margin-top: 20px;
+        padding-top: 16px;
+        border-top: 1px solid #e9e9e1;
+      }
+      .inline-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .scanlist {
+        display: none;
+        max-height: 190px;
+        overflow: auto;
+        margin-top: 8px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fffefa;
+      }
+      .scanlist.show {
+        display: block;
+      }
+      .scan-option {
+        width: 100%;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 12px;
+        border: 0;
+        border-bottom: 1px solid #eeeee8;
+        background: transparent;
+        color: var(--ink);
+        text-align: left;
+        font-size: 13px;
+      }
+      .scan-option:last-child {
+        border-bottom: 0;
+      }
+      .scan-option:hover {
+        background: #f4f6f1;
+      }
+      .scan-option small {
+        color: var(--muted);
+      }
+      .system-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .field-note {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .disconnected-copy {
+        color: var(--muted);
+      }
+      #lanGate {
+        width: min(640px, calc(100% - 32px));
+        margin: 12vh auto;
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+      #lanGate h1 { margin: 0 0 10px; font-size: 25px; }
+      #lanGate p { margin: 0; color: var(--muted); }
+      #toast {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        z-index: 30;
+        max-width: min(520px, calc(100vw - 24px));
+        transform: translate(-50%, 14px);
+        border: 1px solid #26362f;
+        background: #1c2c25;
+        color: #fff;
+        padding: 11px 16px;
+        border-radius: 11px;
+        font-size: 13px;
+        font-weight: 600;
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity 0.18s,
+          transform 0.18s;
+        box-shadow: 0 12px 32px #16271f35;
+      }
+      #toast.show {
+        opacity: 1;
+        transform: translate(-50%, 0);
+      }
+      #toast.bad {
+        background: #773a33;
+        border-color: #773a33;
+      }
+      #toast.ok {
+        background: #176453;
+        border-color: #176453;
+      }
+      @media (max-width: 760px) {
+        .top-inner {
+          padding: 0 16px;
+        }
+        main {
+          padding: 20px 16px 48px;
+        }
+        .nav {
+          margin-bottom: 24px;
+        }
+        .sim-grid {
+          gap: 11px;
+        }
+        .sim-card {
+          padding: 17px;
+        }
+        .phone {
+          font-size: 21px;
+        }
+        .network-grid {
+          gap: 9px;
+        }
+        .network-card {
+          padding: 13px;
+        }
+      }
+      @media (max-width: 560px) {
+        .topbar {
+          height: 62px;
+        }
+        .top-inner {
+          padding: 0 12px;
+          gap: 10px;
+        }
+        .mark {
+          width: 31px;
+          height: 31px;
+        }
+        .device-name {
+          max-width: 110px;
+        }
+        .connection {
+          gap: 8px;
+        }
+        .connection-state {
+          font-size: 12px;
+        }
+        .connection-state span:last-child {
+          display: none;
+        }
+        .button {
+          min-height: 38px;
+          padding: 8px 11px;
+        }
+        .button-primary {
+          font-size: 12px;
+        }
+        main {
+          min-height: calc(100vh - 62px);
+          padding: 17px 13px 40px;
+        }
+        .nav {
+          margin: 0 -13px 23px;
+          padding: 0 9px;
+        }
+        .nav button {
+          padding: 10px 12px 11px;
+        }
+        .view-head {
+          align-items: flex-start;
+          flex-direction: column;
+          margin-bottom: 17px;
+        }
+        .view-sub {
+          margin-top: 6px;
+        }
+        .sim-grid {
+          grid-template-columns: 1fr;
+        }
+        .sim-card {
+          padding: 17px 18px;
+        }
+        .phone {
+          margin: 19px 0 14px;
+        }
+        .network-grid {
+          grid-template-columns: 1fr;
+        }
+        .network-card {
+          padding: 13px 15px;
+          display: grid;
+          grid-template-columns: 90px minmax(0, 1fr);
+          align-items: center;
+          gap: 2px 12px;
+        }
+        .network-label {
+          grid-row: 1/3;
+          justify-content: flex-start;
+        }
+        .network-value {
+          margin: 0;
+        }
+        .network-detail {
+          margin: 1px 0 0;
+        }
+        .panel {
+          padding: 17px;
+        }
+        .form-grid {
+          grid-template-columns: 1fr;
+        }
+        .field-wide {
+          grid-column: auto;
+        }
+        .actions {
+          justify-content: stretch;
+        }
+        .actions .button {
+          flex: 1;
+        }
+        .system-actions .button {
+          flex: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="top-inner">
+        <div class="identity">
+          <div class="mark" aria-hidden="true">SF</div>
+          <div>
+            <div class="product">SMSF · 短信转发</div>
+            <span class="device-name" id="devName">设备未连接</span>
+          </div>
+        </div>
+        <div class="connection">
+          <div class="connection-state">
+            <i class="lamp" id="dot" aria-hidden="true"></i
+            ><span id="connText" aria-live="polite">未连接</span>
+          </div>
+          <button class="button button-primary" id="btnConnect" type="button">
+            连接设备
+          </button>
+        </div>
+      </div>
+    </header>
+    <section id="lanGate" hidden aria-live="polite">
+      <h1>设备局域网管理</h1>
+      <p id="lanGateMessage">正在检查设备…</p>
+    </section>
+    <main>
+      <nav class="nav" aria-label="设备页面">
+        <button type="button" data-view="overview" aria-current="page">
+          设备概览
+        </button>
+        <button type="button" data-view="network">网络</button>
+        <button type="button" data-view="feishu">飞书</button>
+        <button type="button" data-view="slots">卡槽</button>
+        <button type="button" data-view="system">系统</button>
+      </nav>
+
+      <section
+        class="view"
+        id="view-overview"
+        aria-labelledby="heading-overview"
+      >
+        <div class="view-head">
+          <div>
+            <h1 id="heading-overview">设备概览</h1>
+            <p class="view-sub" id="overviewSub">设备未连接</p>
+          </div>
+          <div id="overviewAction"></div>
+        </div>
+        <div class="sim-grid" id="simGrid" aria-live="polite">
+          <article class="sim-card" id="sim0"></article>
+          <article class="sim-card" id="sim1"></article>
+        </div>
+        <section class="network-section" aria-labelledby="network-heading">
+          <h2 class="section-title" id="network-heading">连接状态</h2>
+          <div class="network-grid" id="networkGrid"></div>
+        </section>
+      </section>
+
+      <section
+        class="view"
+        id="view-network"
+        aria-labelledby="heading-network"
+        hidden
+      >
+        <div class="view-head">
+          <div>
+            <h1 id="heading-network">网络</h1>
+          </div>
+        </div>
+        <section class="panel">
+          <div class="form-grid">
+            <div class="field field-wide">
+              <label for="ssid">Wi-Fi 名称</label>
+              <div class="row">
+                <input
+                  class="input"
+                  id="ssid"
+                  autocomplete="off"
+                  maxlength="63"
+                  placeholder="SSID"
+                /><button
+                  class="button"
+                  id="btnScan"
+                  data-device-action
+                  type="button"
+                >
+                  扫描网络
+                </button>
+              </div>
+              <div
+                class="scanlist"
+                id="scanList"
+                role="listbox"
+                aria-label="可用 Wi-Fi 网络"
+              ></div>
+            </div>
+            <div class="field field-wide">
+              <label for="pass">Wi-Fi 密码</label
+              ><input
+                class="input"
+                id="pass"
+                type="password"
+                autocomplete="new-password"
+                placeholder="留空则保留现有密码"
+              />
+            </div>
+            <div class="field field-wide">
+              <label class="switch"
+                ><input type="checkbox" id="dhcp" checked /><span
+                  >自动获取 IP（DHCP）</span
+                ></label
+              >
+            </div>
+            <div class="field field-wide hidden" id="staticBox">
+              <div class="form-grid">
+                <div class="field">
+                  <label for="ip">IP 地址</label
+                  ><input
+                    class="input"
+                    id="ip"
+                    inputmode="decimal"
+                    placeholder="192.168.1.50"
+                  />
+                </div>
+                <div class="field">
+                  <label for="mask">子网掩码</label
+                  ><input
+                    class="input"
+                    id="mask"
+                    inputmode="decimal"
+                    placeholder="255.255.255.0"
+                  />
+                </div>
+                <div class="field">
+                  <label for="gw">网关</label
+                  ><input
+                    class="input"
+                    id="gw"
+                    inputmode="decimal"
+                    placeholder="192.168.1.1"
+                  />
+                </div>
+                <div class="field">
+                  <label for="dns">DNS</label
+                  ><input
+                    class="input"
+                    id="dns"
+                    inputmode="decimal"
+                    placeholder="223.5.5.5"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="actions">
+            <button
+              class="button button-primary"
+              id="btnSaveWifi"
+              data-device-action
+              type="button"
+            >
+              保存并连接
+            </button>
+          </div>
+        </section>
+      </section>
+
+      <section
+        class="view"
+        id="view-feishu"
+        aria-labelledby="heading-feishu"
+        hidden
+      >
+        <div class="view-head">
+          <div>
+            <h1 id="heading-feishu">飞书</h1>
+          </div>
+        </div>
+        <section class="panel">
+          <div class="form-grid">
+            <div class="field field-wide">
+              <label for="appid">App ID</label
+              ><input
+                class="input"
+                id="appid"
+                autocomplete="off"
+                placeholder="cli_…"
+              />
+            </div>
+            <div class="field field-wide">
+              <label for="appsecret">App Secret</label
+              ><input
+                class="input"
+                id="appsecret"
+                type="password"
+                autocomplete="new-password"
+                placeholder="留空则保留现有密钥"
+              />
+            </div>
+          </div>
+          <div class="actions">
+            <button
+              class="button button-primary"
+              id="btnSaveFs"
+              data-device-action
+              type="button"
+            >
+              保存飞书配置
+            </button>
+          </div>
+        </section>
+      </section>
+
+      <section
+        class="view"
+        id="view-slots"
+        aria-labelledby="heading-slots"
+        hidden
+      >
+        <div class="view-head">
+          <div>
+            <h1 id="heading-slots">卡槽</h1>
+          </div>
+        </div>
+        <section class="panel">
+          <div class="form-grid">
+            <div class="field">
+              <label for="s1name">卡槽 1 名称</label
+              ><input
+                class="input"
+                id="s1name"
+                placeholder="卡1"
+                maxlength="23"
+              />
+            </div>
+            <div class="field">
+              <label for="s1num">卡槽 1 本机号码</label
+              ><input
+                class="input"
+                id="s1num"
+                placeholder="留空自动读取"
+                inputmode="tel"
+                maxlength="31"
+              />
+            </div>
+            <div class="field">
+              <label for="s2name">卡槽 2 名称</label
+              ><input
+                class="input"
+                id="s2name"
+                placeholder="卡2"
+                maxlength="23"
+              />
+            </div>
+            <div class="field">
+              <label for="s2num">卡槽 2 本机号码</label
+              ><input
+                class="input"
+                id="s2num"
+                placeholder="留空自动读取"
+                inputmode="tel"
+                maxlength="31"
+              />
+            </div>
+          </div>
+          <div class="actions">
+            <button
+              class="button button-primary"
+              id="btnSaveSlots"
+              data-device-action
+              type="button"
+            >
+              保存卡槽
+            </button>
+          </div>
+        </section>
+      </section>
+
+      <section
+        class="view"
+        id="view-system"
+        aria-labelledby="heading-system"
+        hidden
+      >
+        <div class="view-head">
+          <div>
+            <h1 id="heading-system">系统</h1>
+          </div>
+        </div>
+        <section class="panel">
+          <div class="form-grid">
+            <div class="field">
+              <label for="tz">时区 UTC 偏移（小时）</label
+              ><input
+                class="input"
+                id="tz"
+                type="number"
+                min="-12"
+                max="14"
+                step="1"
+                value="8"
+              />
+            </div>
+          </div>
+          <div class="actions">
+            <button
+              class="button button-primary"
+              id="btnSaveTz"
+              data-device-action
+              type="button"
+            >
+              保存时区
+            </button>
+          </div>
+        </section>
+        <section class="panel" style="margin-top: 14px">
+          <h2 class="section-title">设备操作</h2>
+          <div class="system-actions">
+            <button
+              class="button"
+              id="btnReboot"
+              data-device-action
+              type="button"
+            >
+              重启设备</button
+            ><button
+              class="button button-danger"
+              id="btnFactory"
+              data-device-action
+              type="button"
+            >
+              恢复出厂设置
+            </button>
+          </div>
+        </section>
+      </section>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script>
+      "use strict";
+      const SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+        CMD = "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+        RSP = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+      const enc = new TextEncoder();
+      const S = {
+        device: null,
+        cmd: null,
+        rsp: null,
+        connected: false,
+        connecting: false,
+        seq: 1,
+        pending: new Map(),
+        buf: "",
+        decoder: new TextDecoder(),
+        statusTimer: null,
+        writeChain: Promise.resolve(),
+        view: "overview",
+        transport: "ble",
+        lanToken: "",
+      };
+      const $ = (id) => document.getElementById(id);
+      const drafts = new Map();
+      const fields = {
+        wifi: ["ssid", "pass", "dhcp", "ip", "mask", "gw", "dns"],
+        feishu: ["appid", "appsecret"],
+        slots: ["s1name", "s1num", "s2name", "s2num"],
+        time: ["tz"],
+      };
+      for (const [group, ids] of Object.entries(fields)) {
+        for (const id of ids) {
+          const changed = () => drafts.set(group, (drafts.get(group) || 0) + 1);
+          $(id).addEventListener("input", changed);
+          $(id).addEventListener("change", changed);
+        }
+      }
+      function saved(group, version) {
+        if (drafts.get(group) !== version) return false;
+        drafts.delete(group);
+        return true;
+      }
+      function toast(msg, kind = "") {
+        const t = $("toast");
+        t.textContent = msg;
+        t.className = "show " + kind;
+        clearTimeout(t._h);
+        t._h = setTimeout(() => (t.className = ""), 3300);
+      }
+      function deviceError(msg) {
+        return msg === "physical_presence_required"
+          ? "按设备 BOOT 键，或在 USB 控制台输入 provision，再于 2 分钟内重试"
+          : msg || "设备操作失败";
+      }
+      function setConn(on) {
+        S.connected = on;
+        $("dot").className = "lamp" + (on ? " on" : "");
+        $("connText").textContent = on ? "已连接" : "未连接";
+        $("btnConnect").textContent = on ? "断开连接" : "连接设备";
+        $("btnConnect").disabled = S.connecting;
+        $("btnConnect").hidden = S.transport === "lan";
+        for (const b of document.querySelectorAll("[data-device-action]"))
+          b.disabled = !on;
+        if (on) {
+          startStatusTimer();
+          $("overviewSub").textContent = "正在读取状态";
+        } else {
+          stopStatusTimer();
+          drafts.clear();
+          $("pass").value = "";
+          $("appsecret").value = "";
+          for (const [id, p] of S.pending) {
+            clearTimeout(p.timer);
+            p.reject(new Error("连接已断开"));
+          }
+          S.pending.clear();
+          S.buf = "";
+          S.decoder = new TextDecoder();
+          $("overviewSub").textContent = "设备未连接";
+          renderUnavailable();
+        }
+      }
+      function setView(name) {
+        if (!document.getElementById("view-" + name)) return;
+        S.view = name;
+        document
+          .querySelectorAll(".nav button")
+          .forEach((b) =>
+            b.setAttribute(
+              "aria-current",
+              b.dataset.view === name ? "page" : "false",
+            ),
+          );
+        document
+          .querySelectorAll(".view")
+          .forEach((v) => (v.hidden = v.id !== "view-" + name));
+        document
+          .querySelector("main")
+          .scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+      document
+        .querySelectorAll(".nav button")
+        .forEach((b) =>
+          b.addEventListener("click", () => setView(b.dataset.view)),
+        );
+      async function connect() {
+        if (S.transport === "lan") return;
+        if (S.connecting) return;
+        if (S.connected) {
+          disconnect();
+          return;
+        }
+        if (!navigator.bluetooth) {
+          toast("此浏览器不支持 Web Bluetooth", "bad");
+          return;
+        }
+        S.connecting = true;
+        $("btnConnect").disabled = true;
+        let device = null;
+        try {
+          device = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: "SMSF-" }],
+            optionalServices: [SVC],
+          });
+          S.device = device;
+          device.removeEventListener(
+            "gattserverdisconnected",
+            onDeviceDisconnect,
+          );
+          device.addEventListener("gattserverdisconnected", onDeviceDisconnect);
+          const server = await device.gatt.connect();
+          const service = await server.getPrimaryService(SVC);
+          const cmd = await service.getCharacteristic(CMD);
+          const rsp = await service.getCharacteristic(RSP);
+          rsp.removeEventListener("characteristicvaluechanged", onNotify);
+          rsp.addEventListener("characteristicvaluechanged", onNotify);
+          S.cmd = cmd;
+          S.rsp = rsp;
+          S.buf = "";
+          S.decoder = new TextDecoder();
+          await rsp.startNotifications();
+          $("devName").textContent = device.name || "已连接设备";
+          device.removeEventListener(
+            "gattserverdisconnected",
+            onDeviceDisconnect,
+          );
+          device.addEventListener("gattserverdisconnected", onDeviceDisconnect);
+          setConn(true);
+          toast("设备已连接", "ok");
+          refresh();
+        } catch (e) {
+          if (device) {
+            device.removeEventListener(
+              "gattserverdisconnected",
+              onDeviceDisconnect,
+            );
+            if (device.gatt?.connected) device.gatt.disconnect();
+          }
+          if (S.device === device) S.device = null;
+          S.cmd = null;
+          S.rsp = null;
+          S.buf = "";
+          S.decoder = new TextDecoder();
+          setConn(false);
+          toast("连接失败：" + (e?.message || "未知错误"), "bad");
+        } finally {
+          S.connecting = false;
+          $("btnConnect").disabled = false;
+        }
+      }
+      function onDeviceDisconnect() {
+        S.cmd = null;
+        S.rsp = null;
+        setConn(false);
+        toast("连接已断开");
+      }
+      function disconnect() {
+        if (S.device?.gatt?.connected) S.device.gatt.disconnect();
+        else setConn(false);
+      }
+      $("btnConnect").addEventListener("click", connect);
+      function onNotify(ev) {
+        S.buf += S.decoder.decode(ev.target.value, { stream: true });
+        if (S.buf.length > 8192) {
+          S.buf = "";
+          return;
+        }
+        let n;
+        while ((n = S.buf.indexOf("\n")) >= 0) {
+          const line = S.buf.slice(0, n);
+          S.buf = S.buf.slice(n + 1);
+          if (!line) continue;
+          let msg;
+          try {
+            msg = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (!msg || !Number.isInteger(msg.id)) continue;
+          const p = S.pending.get(msg.id);
+          if (p) {
+            clearTimeout(p.timer);
+            S.pending.delete(msg.id);
+            if (p.cmd === "status" && msg.ok) renderStatus(msg);
+            p.resolve(msg);
+          }
+        }
+      }
+      function rpc(obj, timeout = 8000) {
+        if (S.transport === "lan") return lanRpc(obj, timeout);
+        return new Promise((resolve, reject) => {
+          if (!S.connected || !S.cmd) {
+            reject(new Error("未连接"));
+            return;
+          }
+          const id = S.seq++;
+          const payload = { ...obj, id };
+          S.pending.set(id, {
+            resolve,
+            reject,
+            cmd: obj.cmd,
+            timer: setTimeout(() => {
+              if (S.pending.has(id)) {
+                S.pending.delete(id);
+                reject(new Error("设备响应超时"));
+              }
+            }, timeout),
+          });
+          const bytes = enc.encode(JSON.stringify(payload) + "\n");
+          S.writeChain = S.writeChain
+            .then(async () => {
+              for (let i = 0; i < bytes.length; i += 20)
+                await S.cmd.writeValueWithResponse(bytes.slice(i, i + 20));
+            })
+            .catch((e) => {
+              const p = S.pending.get(id);
+              if (p) {
+                clearTimeout(p.timer);
+                S.pending.delete(id);
+                p.reject(e);
+              }
+            });
+        });
+      }
+      const lanStorageKey = () => "smsf-lan-token:" + location.origin;
+      function setLanGate(message) {
+        stopStatusTimer();
+        S.connected = false;
+        S.lanToken = "";
+        $("btnConnect").hidden = true;
+        $("dot").className = "lamp";
+        $("connText").textContent = "局域网管理";
+        $("devName").textContent = "设备局域网管理";
+        document.querySelector("main").hidden = true;
+        $("lanGateMessage").textContent = message;
+        $("lanGate").hidden = false;
+        for (const b of document.querySelectorAll("[data-device-action]")) b.disabled = true;
+      }
+      function clearLanToken() {
+        S.lanToken = "";
+        try { sessionStorage.removeItem(lanStorageKey()); } catch {}
+      }
+      function lockLan(message) {
+        clearLanToken();
+        setLanGate(message);
+      }
+      async function lanRpc(obj, timeout = 8000) {
+        if (!S.lanToken) throw new Error("请在飞书发送 /web 获取管理链接");
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        let response;
+        try {
+          response = await fetch("/api/rpc", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + S.lanToken,
+            },
+            cache: "no-store",
+            credentials: "same-origin",
+            referrerPolicy: "no-referrer",
+            signal: controller.signal,
+            body: JSON.stringify({ ...obj, id: S.seq++ }),
+          });
+        } catch (error) {
+          throw new Error(error?.name === "AbortError" ? "设备响应超时" : "设备暂不可达，请检查 Wi-Fi 或重新获取 /web 链接");
+        } finally {
+          clearTimeout(timer);
+        }
+        if (response.status === 401 || response.status === 403) {
+          lockLan("管理授权已失效，请在飞书私聊发送 /web 获取新链接");
+          throw new Error("管理授权已失效");
+        }
+        if (!response.ok) throw new Error("设备请求失败（HTTP " + response.status + "）");
+        let result;
+        try { result = await response.json(); } catch { throw new Error("设备响应格式异常"); }
+        if (obj.cmd === "status" && result.ok) {
+          renderStatus(result);
+          $("connText").textContent = "局域网已连接";
+        }
+        return result;
+      }
+      async function detectLanTransport() {
+        const hash = new URLSearchParams(location.hash.slice(1));
+        const fragmentToken = hash.get("token") || "";
+        let info;
+        try {
+          const response = await fetch("/api/info", {
+            method: "GET", cache: "no-store", credentials: "same-origin", referrerPolicy: "no-referrer",
+          });
+          if (!response.ok) {
+            if (fragmentToken) history.replaceState(null, "", location.pathname + location.search);
+            return;
+          }
+          info = await response.json();
+        } catch { return; }
+        if (!info || info.transport !== "lan") {
+          if (fragmentToken) history.replaceState(null, "", location.pathname + location.search);
+          return;
+        }
+        S.transport = "lan";
+        history.replaceState(null, "", location.pathname + location.search);
+        document.querySelector("main").hidden = true;
+        $("btnConnect").hidden = true;
+        $("devName").textContent = "设备局域网管理";
+        let token = /^[a-f0-9]{32}$/.test(fragmentToken) ? fragmentToken : "";
+        if (!token) {
+          try { token = sessionStorage.getItem(lanStorageKey()) || ""; } catch {}
+        } else {
+          try { sessionStorage.setItem(lanStorageKey(), token); } catch {}
+        }
+        if (!/^[a-f0-9]{32}$/.test(token)) {
+          lockLan("请在飞书私聊发送 /web，打开回复中的链接进入设备管理");
+          return;
+        }
+        S.lanToken = token;
+        $("lanGate").hidden = false;
+        $("lanGateMessage").textContent = "正在验证管理链接…";
+        try {
+          const status = await lanRpc({ cmd: "status" });
+          if (!status.ok) {
+            lockLan("管理链接无效，请在飞书私聊发送 /web 获取新链接");
+            return;
+          }
+          $("lanGate").hidden = true;
+          document.querySelector("main").hidden = false;
+          setConn(true);
+          renderStatus(status);
+          $("connText").textContent = "局域网已连接";
+          $("devName").textContent = status.data?.device_name || "设备局域网管理";
+        } catch (error) {
+          if (S.lanToken) {
+            $("lanGate").hidden = false;
+            $("lanGateMessage").textContent = error.message || "设备暂不可达，请检查 Wi-Fi 后重试";
+          }
+        }
+      }
+      function startStatusTimer() {
+        stopStatusTimer();
+        S.statusTimer = setInterval(() => {
+          if (!S.pending.size) refresh();
+        }, 9000);
+      }
+      function stopStatusTimer() {
+        if (S.statusTimer) clearInterval(S.statusTimer);
+        S.statusTimer = null;
+      }
+      function refresh() {
+        rpc({ cmd: "status" }).catch((error) => {
+          if (S.transport === "lan" && S.lanToken) {
+            $("connText").textContent = "局域网暂不可达";
+            $("overviewSub").textContent = "设备暂时无法访问；检查 Wi-Fi 后会自动重试，或在飞书发送 /web 获取新地址";
+          }
+        });
+      }
+      function esc(x) {
+        return String(x ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      }
+      function sigLevel(csq) {
+        if (!Number.isInteger(csq) || csq < 0) return 0;
+        return csq === 0 ? 1 : csq < 10 ? 1 : csq < 17 ? 2 : csq < 24 ? 3 : 4;
+      }
+      function renderSlot(i, s) {
+        const card = $("sim" + i);
+        if (!s) {
+          const state = S.connected ? "读取状态中" : "设备未连接";
+          card.innerHTML = `<div class="sim-top"><div><span class="sim-index">SIM ${i + 1}</span><h2 class="slot-name">卡槽 ${i + 1}</h2></div><span class="reg-pill">${state}</span></div><p class="phone unknown">${state}</p><div class="sim-meta"><span class="carrier">运营商未知</span><span class="signal">信号未知</span></div>`;
+          return;
+        }
+        const reg =
+            s.reg === true ? "已注册" : s.reg === false ? "未注册" : "状态未知",
+          pill = s.reg === true ? "yes" : s.reg === false ? "no" : "";
+        const phone = s.num || "号码未知",
+          csq =
+            Number.isInteger(s.csq) && s.csq >= 0 ? `CSQ ${s.csq}` : "信号未知";
+        card.innerHTML = `<div class="sim-top"><div><span class="sim-index">SIM ${i + 1}</span><h2 class="slot-name">${esc(s.name || `卡槽 ${i + 1}`)}</h2></div><span class="reg-pill ${pill}">${reg}</span></div><p class="phone ${!s.num ? "unknown" : ""}">${esc(phone)}</p><div class="sim-meta"><span class="carrier">${esc(s.op || "运营商未知")}</span><span class="signal"><i class="signal-bars" data-level="${sigLevel(s.csq)}" aria-hidden="true"><i></i><i></i><i></i><i></i></i><strong>${csq}</strong></span></div>`;
+      }
+      function renderUnavailable() {
+        renderSlot(0, null);
+        renderSlot(1, null);
+        $("networkGrid").innerHTML = [
+          ["Wi-Fi", "未连接", "设备未连接"],
+          ["飞书", "状态未知", "设备未连接"],
+          ["设备时间", "状态未知", "设备未连接"],
+        ]
+          .map(
+            ([k, v, d]) =>
+              `<article class="network-card"><div class="network-label">${k}</div><div class="network-value state-warn">${v}</div><div class="network-detail">${d}</div></article>`,
+          )
+          .join("");
+      }
+      function renderStatus(msg) {
+        const d = msg.data || {},
+          slots = d.slots || [],
+          wifi = d.wifi || {},
+          fs = d.feishu || {},
+          time = d.time || {};
+        renderSlot(0, slots[0]);
+        renderSlot(1, slots[1]);
+        $("overviewSub").textContent =
+          `最近读取 ${new Date().toLocaleTimeString()}`;
+        const timeText = time.synced
+          ? new Date(
+              (Number(time.utc || 0) + Number(time.tz || 0) * 3600) * 1000,
+            )
+              .toISOString()
+              .slice(0, 16)
+              .replace("T", " ")
+          : "时间未同步";
+        const wifiState = wifi.ip ? "已连接" : "未连接",
+          wifiDetail = wifi.ip
+            ? `${wifi.cfg_ssid || wifi.ssid || "Wi-Fi"} · ${wifi.ip}${wifi.rssi !== undefined ? ` · ${wifi.rssi} dBm` : ""}${wifi.up ? ` · ${Math.floor(wifi.up / 3600)} 小时` : ""}`
+            : wifi.cfg_ssid
+              ? "等待连接"
+              : "未配置";
+        const fsState =
+          fs.state === "online"
+            ? "已连接"
+            : fs.configured
+              ? "未连接"
+              : "未配置";
+        const items = [
+          [
+            "Wi-Fi",
+            wifiState,
+            wifiDetail,
+            wifi.ip ? "state-good" : "state-warn",
+          ],
+          [
+            "飞书",
+            fsState,
+            fs.app_id || "应用未配置",
+            fs.state === "online" ? "state-good" : "state-warn",
+          ],
+          [
+            "设备时间",
+            time.synced ? "已同步" : "未同步",
+            timeText,
+            time.synced ? "state-good" : "state-warn",
+          ],
+        ];
+        $("networkGrid").innerHTML = items
+          .map(
+            ([k, v, detail, state]) =>
+              `<article class="network-card"><div class="network-label">${k}</div><div class="network-value ${state}">${v}</div><div class="network-detail">${esc(detail)}</div></article>`,
+          )
+          .join("");
+        if (
+          slots[0] && !drafts.has("slots") &&
+          !["s1name", "s1num"].includes(document.activeElement?.id)
+        ) {
+          $("s1name").value = slots[0].name || "";
+          $("s1num").value = slots[0].cfg_num || "";
+        }
+        if (
+          slots[1] && !drafts.has("slots") &&
+          !["s2name", "s2num"].includes(document.activeElement?.id)
+        ) {
+          $("s2name").value = slots[1].name || "";
+          $("s2num").value = slots[1].cfg_num || "";
+        }
+        if (
+          !drafts.has("wifi") && !["ssid", "pass", "dhcp", "ip", "mask", "gw", "dns"].includes(
+            document.activeElement?.id,
+          )
+        ) {
+          $("ssid").value = wifi.cfg_ssid || wifi.ssid || "";
+          $("dhcp").checked = wifi.dhcp !== false;
+          $("staticBox").classList.toggle("hidden", $("dhcp").checked);
+          $("ip").value = wifi.cfg_ip || "";
+          $("mask").value = wifi.mask || "";
+          $("gw").value = wifi.gw || "";
+          $("dns").value = wifi.dns || "";
+        }
+        if (!drafts.has("time") && time.tz !== undefined && document.activeElement?.id !== "tz")
+          $("tz").value = time.tz;
+        if (!drafts.has("feishu") && document.activeElement?.id !== "appid")
+          $("appid").value = fs.app_id || "";
+      }
+      function busy(btn, working, fn) {
+        return async () => {
+          if (!S.connected) return;
+          const label = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = working;
+          try {
+            await fn();
+          } finally {
+            btn.textContent = label;
+            btn.disabled = !S.connected;
+          }
+        };
+      }
+      function errToast(e) {
+        toast(e?.message || "操作失败", "bad");
+      }
+      $("dhcp").addEventListener("change", (e) =>
+        $("staticBox").classList.toggle("hidden", e.target.checked),
+      );
+      $("btnScan").addEventListener(
+        "click",
+        busy($("btnScan"), "扫描中…", async () => {
+          try {
+            const r = await rpc({ cmd: "wifi_scan" }, 18000);
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            const list = $("scanList");
+            list.innerHTML =
+              (r.data || [])
+                .map(
+                  (a) =>
+                    `<button class="scan-option" type="button" role="option" data-ssid="${esc(a.ssid)}"><span>${esc(a.ssid)}</span><small>${Number(a.rssi)} dBm</small></button>`,
+                )
+                .join("") || '<div class="scan-option">无结果</div>';
+            list.classList.add("show");
+            list.querySelectorAll("[data-ssid]").forEach(
+              (b) =>
+                (b.onclick = () => {
+                  $("ssid").value = b.dataset.ssid;
+                  $("ssid").dispatchEvent(new Event("input"));
+                  list.classList.remove("show");
+                }),
+            );
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnSaveWifi").addEventListener(
+        "click",
+        busy($("btnSaveWifi"), "正在保存…", async () => {
+          const version = drafts.get("wifi");
+          const body = {
+            cmd: "wifi_set",
+            ssid: $("ssid").value,
+            pass: $("pass").value,
+            dhcp: $("dhcp").checked,
+            ip: $("ip").value,
+            mask: $("mask").value,
+            gw: $("gw").value,
+            dns: $("dns").value,
+          };
+          if (!body.ssid.trim()) {
+            toast("请填写 Wi-Fi 名称", "bad");
+            return;
+          }
+          try {
+            const r = await rpc(body, 15000);
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            if (saved("wifi", version)) $("pass").value = "";
+            toast("网络配置已保存，正在连接", "ok");
+            refresh();
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnSaveFs").addEventListener(
+        "click",
+        busy($("btnSaveFs"), "正在保存…", async () => {
+          const version = drafts.get("feishu");
+          try {
+            const body = { cmd: "feishu_set", app_id: $("appid").value };
+            if ($("appsecret").value) body.app_secret = $("appsecret").value;
+            const r = await rpc(body);
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            if (saved("feishu", version)) $("appsecret").value = "";
+            toast("飞书配置已保存", "ok");
+            refresh();
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnSaveSlots").addEventListener(
+        "click",
+        busy($("btnSaveSlots"), "正在保存…", async () => {
+          const version = drafts.get("slots");
+          try {
+            for (const [slot, name, number] of [
+              [1, $("s1name").value, $("s1num").value],
+              [2, $("s2name").value, $("s2num").value],
+            ]) {
+              const r = await rpc({ cmd: "slot_set", slot, name, number });
+              if (!r.ok) {
+                toast(deviceError(r.err), "bad");
+                return;
+              }
+            }
+            saved("slots", version);
+            toast("卡槽配置已保存", "ok");
+            refresh();
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnSaveTz").addEventListener(
+        "click",
+        busy($("btnSaveTz"), "正在保存…", async () => {
+          const version = drafts.get("time");
+          const offset = Number($("tz").value);
+          if (!Number.isInteger(offset) || offset < -12 || offset > 14) {
+            toast("时区范围为 -12 到 14 小时", "bad");
+            return;
+          }
+          try {
+            const r = await rpc({ cmd: "tz_set", offset });
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            saved("time", version);
+            toast("时区已保存", "ok");
+            refresh();
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnReboot").addEventListener(
+        "click",
+        busy($("btnReboot"), "正在重启…", async () => {
+          try {
+            const r = await rpc({ cmd: "reboot" }, 2500);
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            toast("设备正在重启", "ok");
+          } catch (e) {
+            toast("设备正在重启", "ok");
+          }
+          setTimeout(() => setConn(false), 900);
+        }),
+      );
+      $("btnFactory").addEventListener("click", async () => {
+        if (
+          !S.connected ||
+          !confirm("清除配置、回复映射与去重记录；保留 SIM 内短信。继续？")
+        )
+          return;
+        try {
+          const r = await rpc({ cmd: "factory_reset" }, 2500);
+          if (!r.ok) {
+            toast(deviceError(r.err), "bad");
+            return;
+          }
+          toast("正在恢复出厂设置", "ok");
+          setTimeout(() => setConn(false), 900);
+        } catch (e) {
+          toast(deviceError(e.message), "bad");
+        }
+      });
+      document
+        .querySelectorAll("[data-device-action]")
+        .forEach((b) => (b.disabled = true));
+      setConn(false);
+      detectLanTransport();
+    </script>
+  </body>
+</html>

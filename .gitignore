@@ -1,0 +1,16 @@
+/firmware/build*/
+/firmware/managed_components/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
+/logs/
+/firmware-backup/
+/release/
+__pycache__/
+*.pyc
+*.bin
+*.elf
+*.map
+*.log
+*.zip
+.env
+.env.*
