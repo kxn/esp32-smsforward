@@ -20,6 +20,7 @@
 #include "cmd.h"
 #include "feishu.h"
 #include "cmd_policy.h"
+#include "sim_number_policy.h"
 #include "cfg.h"
 #include "wifi.h"
 #include "ble.h"
@@ -47,71 +48,83 @@ static bool s_safe_mode;
 static TaskHandle_t s_net_task;
 device_slot_status_t device_slots[2];
 static char s_slot_sim[MODEM_COUNT][32];
-static char s_slot_iccid[MODEM_COUNT][32];
-
-static void refresh_iccid_label(int slot)
-{
-    char resp[128] = {0}, digits[32];
-    if (modem_cmd(&s_modems[slot], "AT+ICCID", resp, sizeof(resp), AT_SIM_IDENTITY_MS) != ESP_OK) return;
-    size_t n = 0;
-    for (const char *p = resp; *p && n + 1 < sizeof(digits); ++p)
-        if (*p >= '0' && *p <= '9') digits[n++] = *p;
-    digits[n] = '\0';
-    if (n >= 6) snprintf(s_slot_iccid[slot], sizeof(s_slot_iccid[slot]), "卡%d-%s", slot + 1, digits + n - 6);
-}
-
-static bool quoted_field(const char *src, int field, char *out, size_t cap)
-{
-    const char *p = src;
-    for (int i = 0; i <= field; i++) {
-        p = strchr(p, '"'); if (!p) return false;
-        const char *e = strchr(++p, '"'); if (!e) return false;
-        if (i == field) { size_t n = e - p; if (!n || n >= cap) return false; memcpy(out, p, n); out[n] = 0; return true; }
-        p = e + 1;
-    }
-    return false;
-}
+static SemaphoreHandle_t s_identity_lock[MODEM_COUNT];
 
 esp_err_t cmd_refresh_slot_number(int i, char *number, size_t number_len)
 {
     if (i < 0 || i >= MODEM_COUNT || !number || number_len == 0) return ESP_ERR_INVALID_ARG;
+    if (!s_identity_lock[i] || xSemaphoreTake(s_identity_lock[i], pdMS_TO_TICKS(1000)) != pdTRUE)
+        return MODEM_ERR_BUSY;
     number[0] = '\0';
-    s_slot_sim[i][0] = '\0';
-    s_slot_iccid[i][0] = '\0';
-    cmd_set_slot(i, NULL, "未知");
 
-    char resp[512] = {0}, candidate[32] = {0}, key[12];
+    char resp[640] = {0}, candidate[32] = {0}, key[12];
+    const char *source = NULL;
     esp_err_t e = modem_cmd(&s_modems[i], "AT+CNUM", resp, sizeof(resp), AT_SIM_IDENTITY_MS);
-    if (e == ESP_OK && quoted_field(resp, 1, candidate, sizeof(candidate)) &&
+    if (e == ESP_OK && sim_number_parse_cnum(resp, candidate, sizeof(candidate)) &&
         cmd_policy_local_number(candidate, key, sizeof(key))) {
-        strlcpy(s_slot_sim[i], candidate, sizeof(s_slot_sim[i]));
+        source = "CNUM";
     } else {
-        /* Never fall back to a cached identity after a busy, timeout, or desync. */
-        if (e != ESP_OK && e != ESP_FAIL) return e;
+        if (e != ESP_OK && e != ESP_FAIL) goto transport_error;
         memset(resp, 0, sizeof(resp));
         e = modem_cmd(&s_modems[i], "AT+CPBS=\"ON\"", resp, sizeof(resp), AT_SETUP_MS);
-        if (e != ESP_OK && e != ESP_FAIL) return e;
+        if (e != ESP_OK && e != ESP_FAIL) goto transport_error;
         if (e == ESP_OK) {
             memset(resp, 0, sizeof(resp));
-            e = modem_cmd(&s_modems[i], "AT+CPBR=1,20", resp, sizeof(resp), 5000);
-            if (e == ESP_OK && quoted_field(resp, 0, candidate, sizeof(candidate)) &&
+            e = modem_cmd(&s_modems[i], "AT+CPBR=1", resp, sizeof(resp), 5000);
+            if (e != ESP_OK && e != ESP_FAIL) goto transport_error;
+            if (e == ESP_OK && sim_number_parse_own_phonebook(resp, candidate, sizeof(candidate)) &&
                 cmd_policy_local_number(candidate, key, sizeof(key))) {
-                strlcpy(s_slot_sim[i], candidate, sizeof(s_slot_sim[i]));
-            } else if (e != ESP_OK && e != ESP_FAIL) {
-                return e;
+                source = "ON";
             }
         }
     }
 
+    if (!source) {
+        uint8_t binary[255], count=0;
+        uint16_t record_len=0;
+        size_t binary_len=0;
+        memset(resp,0,sizeof(resp));
+        e=modem_cmd(&s_modems[i],"AT+CRSM=192,28480,0,0,0",resp,sizeof(resp),AT_SIM_IDENTITY_MS);
+        if (e!=ESP_OK && e!=ESP_FAIL) goto transport_error;
+        if (e==ESP_OK && sim_number_parse_crsm(resp,binary,sizeof(binary),&binary_len) &&
+            sim_number_msisdn_layout(binary,binary_len,&record_len,&count)) {
+            unsigned limit=count<2?count:2;
+            for (unsigned record_no=1;record_no<=limit && !source;record_no++) {
+                char command[48];
+                snprintf(command,sizeof(command),"AT+CRSM=178,28480,%u,4,%u",record_no,record_len);
+                memset(resp,0,sizeof(resp));
+                e=modem_cmd(&s_modems[i],command,resp,sizeof(resp),AT_SIM_IDENTITY_MS);
+                if (e!=ESP_OK && e!=ESP_FAIL) goto transport_error;
+                if (e==ESP_OK && sim_number_parse_crsm(resp,binary,sizeof(binary),&binary_len) &&
+                    binary_len==record_len &&
+                    sim_number_decode_msisdn(binary,binary_len,candidate,sizeof(candidate)) &&
+                    cmd_policy_local_number(candidate,key,sizeof(key))) source="EF_MSISDN";
+            }
+        }
+    }
+
+    if (source) {
+        strlcpy(s_slot_sim[i],candidate,sizeof(s_slot_sim[i]));
+        ESP_LOGI(TAG,"SIM %d number source: %s",i+1,source);
+    } else s_slot_sim[i][0]='\0';
+
     const app_cfg_t *c = cfg_get();
     bool manual = cmd_policy_local_number(c->slot_num[i], key, sizeof(key));
-    if (!s_slot_sim[i][0] && !manual) refresh_iccid_label(i);
     const char *resolved = s_slot_sim[i][0] ? s_slot_sim[i] :
-        manual ? c->slot_num[i] : s_slot_iccid[i][0] ? s_slot_iccid[i] : "未知";
+        manual ? c->slot_num[i] : "未知";
     bool has_number = s_slot_sim[i][0] || manual;
-    if (strlcpy(number, resolved, number_len) >= number_len) return ESP_ERR_INVALID_SIZE;
+    if (strlcpy(number, resolved, number_len) >= number_len) {
+        xSemaphoreGive(s_identity_lock[i]); return ESP_ERR_INVALID_SIZE;
+    }
     cmd_set_slot(i, NULL, resolved);
+    if (!source && manual) ESP_LOGI(TAG,"SIM %d number source: manual",i+1);
+    xSemaphoreGive(s_identity_lock[i]);
     return has_number ? ESP_OK : ESP_ERR_NOT_FOUND;
+transport_error:
+    s_slot_sim[i][0]='\0';
+    cmd_set_slot(i,NULL,"未知");
+    xSemaphoreGive(s_identity_lock[i]);
+    return e;
 }
 
 static void resolve_slot_number(int i)
@@ -127,7 +140,7 @@ void device_slot_config_changed(int slot, const char *name, const char *number)
     char key[12];
     const char *resolved = s_slot_sim[slot][0] ? s_slot_sim[slot] :
                            (number && cmd_policy_local_number(number, key, sizeof(key))) ? number :
-                           s_slot_iccid[slot][0] ? s_slot_iccid[slot] : "未知";
+                           "未知";
     cmd_set_slot(slot, name, resolved);
 }
 
@@ -151,6 +164,9 @@ static int response_int(const char *s, const char *key)
 static void slot_status_task(void *arg)
 {
     (void)arg;
+    bool was_registered[MODEM_COUNT] = {0};
+    uint8_t identity_attempts[MODEM_COUNT] = {0};
+    int64_t identity_retry_at[MODEM_COUNT] = {0};
     vTaskDelay(pdMS_TO_TICKS(20000));
     while (1) {
         for (int i = 0; i < MODEM_COUNT; i++) {
@@ -158,17 +174,32 @@ static void slot_status_task(void *arg)
             if (modem_cmd(&s_modems[i], "AT+CEREG?", r, sizeof(r), AT_REGISTRATION_MS) == ESP_OK) {
                 int stat = cmd_policy_cereg_stat(r);
                 device_slots[i].registered = stat == 1 || stat == 5;
+                int64_t now = esp_timer_get_time() / 1000;
+                if (device_slots[i].registered && !was_registered[i]) {
+                    identity_attempts[i] = 0;
+                    identity_retry_at[i] = now + 5000;
+                }
                 device_slots[i].operator_name[0] = 0;
                 device_slots[i].csq = -1;
                 memset(r, 0, sizeof(r));
                 if (modem_cmd(&s_modems[i], "AT+COPS?", r, sizeof(r), AT_OPERATOR_MS) == ESP_OK)
-                    quoted_field(r, 0, device_slots[i].operator_name, sizeof(device_slots[i].operator_name));
+                    sim_number_response_field(r, "+COPS:", 2, device_slots[i].operator_name,
+                                              sizeof(device_slots[i].operator_name));
                 memset(r, 0, sizeof(r));
                 if (modem_cmd(&s_modems[i], "AT+CSQ", r, sizeof(r), AT_SIGNAL_MS) == ESP_OK) {
                     int q = response_int(r, "+CSQ:");
                     device_slots[i].csq = q >= 0 && q <= 31 ? q : -1;
                 }
                 device_slots[i].valid = true;
+                if (device_slots[i].registered && identity_attempts[i] < 3 &&
+                    now >= identity_retry_at[i]) {
+                    char number[32];
+                    esp_err_t identity = cmd_refresh_slot_number(i, number, sizeof(number));
+                    static const uint32_t delays[] = {15000, 60000, 180000};
+                    identity_retry_at[i] = now + delays[identity_attempts[i]++];
+                    if (identity == ESP_OK && s_slot_sim[i][0]) identity_attempts[i] = 3;
+                }
+                was_registered[i] = device_slots[i].registered;
             } else device_slots[i].valid = false;
         }
         /* Keep dashboard status useful without polling both modems too often. */
@@ -401,6 +432,7 @@ void app_main(void)
     gpio_set_level(PIN_LED1, 1);
 
     for (int i = 0; i < MODEM_COUNT; i++) {
+        s_identity_lock[i] = xSemaphoreCreateMutex();
         esp_err_t err = modem_init(&s_modems[i], i);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "modem%d init failed: %s", i + 1, esp_err_to_name(err));

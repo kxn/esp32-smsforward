@@ -324,6 +324,24 @@
         color: var(--muted);
         letter-spacing: 0;
       }
+      .phone-help {
+        appearance: none;
+        display: block;
+        margin: -9px 0 17px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--pine);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        text-align: left;
+        cursor: pointer;
+      }
+      .phone-help:hover,
+      .phone-help:focus-visible {
+        text-decoration: underline;
+      }
       .sim-meta {
         display: flex;
         align-items: center;
@@ -1082,6 +1100,9 @@
               />
             </div>
           </div>
+          <p class="field-note">
+            名称只用于辨认卡槽，不能代替本机号码。设备无法自动读取时，请在对应号码栏填写 SIM 的真实完整号码；空槽保持留空。
+          </p>
           <div class="actions">
             <button
               class="button button-primary"
@@ -1308,6 +1329,14 @@
         .forEach((b) =>
           b.addEventListener("click", () => setView(b.dataset.view)),
         );
+      document.querySelectorAll(".sim-card").forEach((card) =>
+        card.addEventListener("click", (event) => {
+          const help = event.target.closest("[data-number-slot]");
+          if (!help) return;
+          setView("slots");
+          $(help.dataset.numberSlot === "1" ? "s1num" : "s2num").focus();
+        }),
+      );
       async function connect() {
         if (S.transport === "lan") return;
         if (S.connecting) return;
@@ -1731,6 +1760,10 @@
         if (!Number.isInteger(csq) || csq < 0) return 0;
         return csq === 0 ? 1 : csq < 10 ? 1 : csq < 17 ? 2 : csq < 24 ? 3 : 4;
       }
+      function selectableNumber(value) {
+        const number = typeof value === "string" ? value.trim() : "";
+        return /^(?:\+?86)?1\d{10}$/.test(number) ? number : "";
+      }
       function renderSlot(i, s) {
         const card = $("sim" + i);
         if (!s) {
@@ -1741,10 +1774,13 @@
         const reg =
             s.reg === true ? "已注册" : s.reg === false ? "未注册" : "状态未知",
           pill = s.reg === true ? "yes" : s.reg === false ? "no" : "";
-        const phone = s.num || "号码未知",
+        const phone = selectableNumber(s.num),
           csq =
             Number.isInteger(s.csq) && s.csq >= 0 ? `CSQ ${s.csq}` : "信号未知";
-        card.innerHTML = `<div class="sim-top"><div><span class="sim-index">SIM ${i + 1}</span><h2 class="slot-name">${esc(s.name || `卡槽 ${i + 1}`)}</h2></div><span class="reg-pill ${pill}">${reg}</span></div><p class="phone ${!s.num ? "unknown" : ""}">${esc(phone)}</p><div class="sim-meta"><span class="carrier">${esc(s.op || "运营商未知")}</span><span class="signal"><i class="signal-bars" data-level="${sigLevel(s.csq)}" aria-hidden="true"><i></i><i></i><i></i><i></i></i><strong>${csq}</strong></span></div>`;
+        const numberHelp = phone
+          ? ""
+          : `<button class="phone-help" type="button" data-number-slot="${i + 1}">前往卡槽手动填写</button>`;
+        card.innerHTML = `<div class="sim-top"><div><span class="sim-index">SIM ${i + 1}</span><h2 class="slot-name">${esc(s.name || `卡槽 ${i + 1}`)}</h2></div><span class="reg-pill ${pill}">${reg}</span></div><p class="phone ${!phone ? "unknown" : ""}">${esc(phone || "本机号码未知")}</p>${numberHelp}<div class="sim-meta"><span class="carrier">${esc(s.op || "运营商未知")}</span><span class="signal"><i class="signal-bars" data-level="${sigLevel(s.csq)}" aria-hidden="true"><i></i><i></i><i></i><i></i></i><strong>${csq}</strong></span></div>`;
       }
       function renderUnavailable() {
         renderSlot(0, null);
@@ -1848,14 +1884,14 @@
           !["s1name", "s1num"].includes(document.activeElement?.id)
         ) {
           $("s1name").value = slots[0].name || "";
-          $("s1num").value = slots[0].cfg_num || "";
+          $("s1num").value = selectableNumber(slots[0].cfg_num);
         }
         if (
           slots[1] && !drafts.has("slots") &&
           !["s2name", "s2num"].includes(document.activeElement?.id)
         ) {
           $("s2name").value = slots[1].name || "";
-          $("s2num").value = slots[1].cfg_num || "";
+          $("s2num").value = selectableNumber(slots[1].cfg_num);
         }
         if (
           !drafts.has("wifi") && !["ssid", "pass", "dhcp", "ip", "mask", "gw", "dns"].includes(

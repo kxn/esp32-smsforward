@@ -30,6 +30,7 @@ CASES = {
     MAIN / "tests/test_cmd_call_notice.c": ["phone_region.c"],
     ROOT / "tools/test_phone_region.c": ["phone_region.c"],
     MAIN / "tests/test_cmd_policy_cereg.c": [],
+    MAIN / "tests/test_sim_number_policy.c": [],
     MAIN / "tests/test_feishu_reply_retry.c": [],
     MAIN / "tests/test_feishu_config_policy.c": [],
     MAIN / "tests/test_feishu_pbbp2.c": ["pbbp2.c"],

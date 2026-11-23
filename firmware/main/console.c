@@ -10,6 +10,7 @@
 #include "wifi.h"
 #include "modem_timing.h"
 #include "power_policy.h"
+#include "sim_number_policy.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -30,6 +31,67 @@
 static const char *TAG = "console";
 
 static modem_t *s_modems;
+
+static const char *number_prefix_class(const char *number)
+{
+    if (!strncmp(number, "0086", 4)) return "0086";
+    if (!strncmp(number, "+86", 3)) return "+86";
+    if (!strncmp(number, "86", 2)) return "86";
+    if (number[0] == '1') return "national";
+    return "other";
+}
+
+static void print_number_result_shapes(const modem_t *m, const char *response,
+                                       const char *anchor, const char *kind)
+{
+    unsigned records = 0;
+    size_t anchor_len = strlen(anchor);
+    for (const char *line = response; line && *line;) {
+        while (*line == '\r' || *line == '\n') ++line;
+        const char *end = line + strcspn(line, "\r\n");
+        if ((size_t)(end - line) >= anchor_len && !memcmp(line, anchor, anchor_len)) {
+            char field2[48] = {0};
+            char shape[256];
+            size_t n = 0;
+            for (const char *p = line + anchor_len; p < end && n + 1 < sizeof(shape); ++p) {
+                unsigned char c = (unsigned char)*p;
+                shape[n++] = c == ' ' || c == ',' || c == '"' || c == '+'
+                           ? (char)c : '#';
+            }
+            shape[n] = '\0';
+            bool have_field2 = sim_number_csv_field(line + anchor_len, end, 1,
+                                                     field2, sizeof(field2));
+            ++records;
+            printf("[M%d] %s record=%u shape=%s field2_prefix=%s\n",
+                   m->idx + 1, kind, records, shape,
+                   have_field2 ? number_prefix_class(field2) : "other");
+        }
+        line = end;
+    }
+    printf("[M%d] %s records=%u\n", m->idx + 1, kind, records);
+}
+
+static bool is_msisdn_record_read(const char *cmd)
+{
+    unsigned length = 0;
+    int used = 0;
+    return sscanf(cmd, "AT+CRSM=178,28480,1,4,%u%n", &length, &used) == 1 &&
+           length > 0 && cmd[used] == '\0';
+}
+
+static void print_crsm_display_match(const modem_t *m, const char *response)
+{
+    uint8_t record[255];
+    size_t record_len = 0;
+    char decoded[32], decoded_key[12], display_key[12];
+    bool matches = sim_number_parse_crsm(response, record, sizeof(record), &record_len) &&
+                   sim_number_decode_msisdn(record, record_len, decoded, sizeof(decoded)) &&
+                   cmd_policy_local_number(decoded, decoded_key, sizeof(decoded_key)) &&
+                   cmd_policy_local_number(cmd_slot_number(m->idx), display_key, sizeof(display_key)) &&
+                   !strcmp(decoded_key, display_key);
+    printf("[M%d] CRSM MSISDN matches_display=%s\n", m->idx + 1,
+           matches ? "yes" : "no");
+}
 
 static void cmd_info(void)
 {
@@ -69,7 +131,7 @@ static void run_at(modem_t *m, const char *cmd, int timeout_ms)
     char resp[1024] = {0};
     esp_err_t err = modem_cmd(m, cmd, resp, sizeof(resp), timeout_ms);
     bool private_cmd = strstr(cmd, "CNUM") || strstr(cmd, "CPBR") || strstr(cmd, "ICCID") ||
-                       strstr(cmd, "CIMI") || strstr(cmd, "CMGR") || strstr(cmd, "CMGS") ||
+                       strstr(cmd, "CRSM") || strstr(cmd, "CIMI") || strstr(cmd, "CMGR") || strstr(cmd, "CMGS") ||
                        strstr(cmd, "CCFC") || !strncmp(cmd, "ATD", 3) || strstr(cmd, "CLCC");
     printf("[%s] > %s  (%s)\n", modem_name(m), private_cmd ? "<sensitive AT command>" : cmd,
            err == ESP_OK ? "OK" : err == ESP_ERR_TIMEOUT ? "TIMEOUT" :
@@ -86,6 +148,13 @@ static void run_at(modem_t *m, const char *cmd, int timeout_ms)
                m->idx + 1, reason, state, on && other &&
                cmd_policy_ccfc_voice(resp, 1, other) ? "other-installed-SIM" :
                on ? "other-or-unspecified" : "none-reported");
+    }
+    if (!strcmp(cmd, "AT+CNUM")) {
+        print_number_result_shapes(m, resp, "+CNUM:", "CNUM");
+    } else if (!strncmp(cmd, "AT+CPBR=", 8)) {
+        print_number_result_shapes(m, resp, "+CPBR:", "CPBR");
+    } else if (is_msisdn_record_read(cmd)) {
+        print_crsm_display_match(m, resp);
     }
     if (resp[0] && !private_cmd) {
         printf("%s", resp);

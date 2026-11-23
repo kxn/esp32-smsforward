@@ -23,7 +23,7 @@ BLE_STUB = r"""
     telemetryUnsupported: false,
     slots: [
       { n: 1, name: '主卡', num: '13800138000', reg: true, op: '中国移动', csq: 23 },
-      { n: 2, name: '备用卡', num: '卡2-123456', reg: false, op: '', csq: null }
+      { n: 2, name: '备用卡', num: '卡2-123456', cfg_num: '卡2-123456', reg: false, op: '', csq: null }
     ],
     wifi: { ssid: 'Studio', cfg_ssid: 'Studio', ip: '192.168.1.40', cfg_ip: '192.168.1.40',
       mask: '255.255.255.0', gw: '192.168.1.1', dns: '223.5.5.5', dhcp: false, rssi: -51, up: 7200 },
@@ -73,7 +73,8 @@ BLE_STUB = r"""
         state.fs = { ...state.fs, configured: true, app_id: req.app_id || state.fs.app_id };
         reply = { id: req.id, ok: true };
       } else if (req.cmd === 'slot_set') {
-        state.slots[req.slot - 1] = { ...state.slots[req.slot - 1], name: req.name, num: req.number };
+        state.slots[req.slot - 1] = { ...state.slots[req.slot - 1], name: req.name,
+          num: req.number, cfg_num: req.number };
         reply = { id: req.id, ok: true };
       } else if (req.cmd === 'tz_set') { state.tz = req.offset; reply = { id: req.id, ok: true }; }
       else if (req.cmd === 'wifi_scan') reply = { id: req.id, ok: true, data: [{ ssid: 'Studio', rssi: -51 }] };
@@ -520,11 +521,32 @@ def main() -> None:
             assert "中国移动" in page.locator("#sim0").inner_text()
             assert "号码未知" not in page.locator("#sim0").inner_text()
             assert "未注册" in page.locator("#sim1").inner_text()
+            assert "本机号码未知" in page.locator("#sim1").inner_text()
+            assert "卡2-123456" not in page.locator("#sim1").inner_text()
+            assert "备用卡" in page.locator("#sim1 .slot-name").inner_text()
             assert "192.168.1.40" in page.locator("#networkGrid").inner_text()
             assert page.locator("#view-overview").is_visible()
             assert page.locator("#view-network").is_hidden()
             test_ble_monitor(page)
             test_ble_setup_guide(page)
+
+            page.locator("#sim1 [data-number-slot='2']").click()
+            assert page.locator("#s2num").input_value() == ""
+            page.get_by_role("button", name="设备概览", exact=True).click()
+            page.evaluate("window.mockBle.slots[1].num = window.mockBle.slots[1].cfg_num = '未知'")
+            page.evaluate("refresh(true)")
+            page.wait_for_function("document.querySelector('#sim1').textContent.includes('本机号码未知')")
+            page.locator("#sim1 [data-number-slot='2']").click()
+            assert page.locator("#view-slots").is_visible()
+            assert page.locator("#s2num").evaluate("el => el === document.activeElement")
+            assert page.locator("#s2num").input_value() == ""
+            assert "名称只用于辨认卡槽" in page.locator("#view-slots").inner_text()
+            page.locator("#s2num").fill("+8613900139000")
+            page.get_by_role("button", name="保存卡槽").click()
+            page.get_by_text("卡槽配置已保存", exact=False).wait_for()
+            page.get_by_role("button", name="设备概览", exact=True).click()
+            page.wait_for_function("document.querySelector('#sim1').textContent.includes('+8613900139000')")
+            assert "本机号码未知" not in page.locator("#sim1").inner_text()
 
             page.get_by_role("button", name="网络", exact=True).click()
             assert page.locator("#view-network").is_visible()

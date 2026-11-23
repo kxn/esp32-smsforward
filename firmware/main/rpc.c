@@ -178,7 +178,9 @@ static cJSON *status_data(void)
         cJSON_AddNumberToObject(slot, "n", i + 1);
         cJSON_AddStringToObject(slot, "name", cfg->slot_name[i]);
         cJSON_AddStringToObject(slot, "cfg_num", cfg->slot_num[i]);
-        cJSON_AddStringToObject(slot, "num", cmd_slot_number(i) ? cmd_slot_number(i) : "");
+        const char *number = cmd_slot_number(i);
+        char local_key[12];
+        cJSON_AddStringToObject(slot, "num", cmd_policy_local_number(number, local_key, sizeof(local_key)) ? number : "");
         if (device_slots[i].valid) cJSON_AddBoolToObject(slot, "reg", device_slots[i].registered);
         else cJSON_AddNullToObject(slot, "reg");
         cJSON_AddStringToObject(slot, "op", device_slots[i].valid ? device_slots[i].operator_name : "");
