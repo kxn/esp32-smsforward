@@ -8,7 +8,8 @@
 
 /* 转发消息格式：发件人 -> 卡N(本机号) / 时间 / 空行 / 正文 */
 int fmt_incoming(char *out, size_t outlen, int slot, const char *slot_name,
-                 const char *local_num, const char *peer, time_t ts, bool time_synced,
+                 const char *local_num, const char *peer, bool sender_is_phone,
+                 time_t ts, bool time_synced,
                  const char *text);
 
 /* 记录我们发出的飞书消息，供"引用回复"定位 */

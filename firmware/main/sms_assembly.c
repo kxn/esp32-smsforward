@@ -43,7 +43,7 @@ static bool add_index(sms_assembly_part_t *p, int idx, uint64_t identity)
 
 sms_assembly_status_t sms_assembly_add(sms_assembly_pool_t *pool, int slot,
     const char *sender, int reference, int reference_width, int total, int sequence,
-    time_t timestamp, bool mms_notification, bool binary_payload_hex,
+    time_t timestamp, bool mms_notification, bool binary_payload_hex, bool sender_is_phone,
     int sim_index, uint64_t identity, const char *text,
     uint64_t now_ms, unsigned timeout_ms, int *assembly_index)
 {
@@ -77,6 +77,7 @@ sms_assembly_status_t sms_assembly_add(sms_assembly_pool_t *pool, int slot,
         a->parts = calloc((size_t)total, sizeof(*a->parts));
         if (!a->parts) { memset(a, 0, sizeof(*a)); return SMS_ASSEMBLY_FULL; }
         a->timestamp = timestamp;
+        a->sender_is_phone = sender_is_phone;
         a->deadline_ms = now_ms + timeout_ms;
         snprintf(a->sender, sizeof(a->sender), "%s", sender);
     }
@@ -85,6 +86,7 @@ sms_assembly_status_t sms_assembly_add(sms_assembly_pool_t *pool, int slot,
     if (assembly_index) *assembly_index = found;
     if (mms_notification) a->mms_notification = true;
     if (binary_payload_hex) a->binary_payload_hex = true;
+    a->sender_is_phone = a->sender_is_phone && sender_is_phone;
     if (sequence == 1 && timestamp) {
         a->timestamp = timestamp;
         a->timestamp_from_sequence_one = true;

@@ -57,6 +57,18 @@ static int bcd_number(const uint8_t *b, int octets, int toa, char *out, size_t o
     return n;
 }
 
+/* Validate wire digits independently of the display decoder, which skips filler. */
+static bool originator_is_phone(const uint8_t *address, int digits, uint8_t toa)
+{
+    unsigned ton = (toa >> 4) & 7;
+    if ((toa & 0x80) == 0 || ton > 2 || digits <= 0 || digits > 15) return false;
+    for (int i = 0; i < digits; ++i) {
+        unsigned nibble = (address[i / 2] >> (4 * (i % 2))) & 0x0f;
+        if (nibble > 9) return false;
+    }
+    return digits % 2 == 0 || (address[digits / 2] >> 4) == 0x0f;
+}
+
 /* UTF-16BE (UCS2) -> UTF-8 */
 static int ucs2_to_utf8(const uint8_t *in, int bytes, char *out, size_t outlen)
 {
@@ -285,6 +297,7 @@ int pdu_decode_deliver(const uint8_t *pdu, size_t len, sms_deliver_t *out)
     int oa_octets = (oa_len + 1) / 2;
     if (i + oa_octets > len) return -1;
     bcd_number(pdu + i, oa_octets, toa, out->sender, sizeof(out->sender));
+    out->sender_is_phone = originator_is_phone(pdu + i, oa_len, toa);
     i += oa_octets;
 
     if (i + 2 > len) return -1;

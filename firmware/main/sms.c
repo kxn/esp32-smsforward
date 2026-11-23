@@ -140,7 +140,8 @@ enum { SMS_JOB_READ = 1, SMS_JOB_SCAN_START, SMS_JOB_SCAN_STEP, SMS_JOB_FLUSH, S
 static EXT_RAM_BSS_ATTR sms_assembly_pool_t s_concat;
 static SemaphoreHandle_t s_concat_lock;
 
-static bool deliver(modem_t *m, const char *peer, time_t ts, const char *text,
+static bool deliver(modem_t *m, const char *peer, bool sender_is_phone,
+                    time_t ts, const char *text,
                     bool complete, int got, int total);
 static bool deliver_mms_notice(modem_t *m, const char *peer, time_t ts, const char *hex, bool complete);
 
@@ -215,7 +216,7 @@ static void concat_flush(int i, bool timeout)
     }
     bool sent = a->mms_notification ?
         deliver_mms_notice(&s_modems[a->slot], a->sender, a->timestamp, merged, got == total) :
-        valid_text && deliver(&s_modems[a->slot], a->sender, a->timestamp, merged,
+        valid_text && deliver(&s_modems[a->slot], a->sender, a->sender_is_phone, a->timestamp, merged,
                 got == total, got, total);
     if (sent) {
         for (int p = 0; p < a->total; ++p) {
@@ -237,7 +238,8 @@ static void concat_add(modem_t *m, int sim_index, const sms_deliver_t *d)
     int ai = -1;
     sms_assembly_status_t st = sms_assembly_add(&s_concat, m->idx, d->sender,
         d->concat_ref, d->concat_ref_width, d->concat_total, d->concat_seq,
-        d->scts, d->mms_notification, d->binary_payload_hex, sim_index, identity, d->text,
+        d->scts, d->mms_notification, d->binary_payload_hex, d->sender_is_phone,
+        sim_index, identity, d->text,
         (uint64_t)(esp_timer_get_time() / 1000), CONCAT_TIMEOUT_MS, &ai);
     if (st == SMS_ASSEMBLY_COMPLETE) concat_flush(ai, false);
     else if (st < 0 || st == SMS_ASSEMBLY_CONFLICT)
@@ -264,7 +266,8 @@ static void concat_timer_task(void *arg)
 
 /* ---------------- 鎶曢€?---------------- */
 
-static bool deliver(modem_t *m, const char *peer, time_t ts, const char *text,
+static bool deliver(modem_t *m, const char *peer, bool sender_is_phone,
+                    time_t ts, const char *text,
                     bool complete, int got, int total)
 {
     if (s_delivery_lock) xSemaphoreTake(s_delivery_lock, portMAX_DELAY);
@@ -293,7 +296,7 @@ static bool deliver(modem_t *m, const char *peer, time_t ts, const char *text,
     bool synced = false;
     time_t display_ts = sms_display_time(m, ts, &synced);
     int formatted = fmt_incoming(out, out_cap, m->idx, cmd_slot_name(m->idx),
-                                 cmd_slot_number(m->idx), peer, display_ts, synced, text);
+                                 cmd_slot_number(m->idx), peer, sender_is_phone, display_ts, synced, text);
     if (formatted < 0 || (size_t)formatted >= out_cap) {
         ESP_LOGE(TAG, "formatted SMS exceeds delivery bound; SIM copy retained");
         free(out);
@@ -347,8 +350,10 @@ static bool deliver_mms_notice(modem_t *m, const char *peer, time_t ts, const ch
     char *suffix = strstr(info.sender, "/TYPE=PLMN");
     if (suffix && !suffix[10]) *suffix = 0;
     char dial[32], display[32];
+    const char *region_peer = NULL;
     if (cmd_policy_dial_number(info.sender, dial, sizeof(dial), display, sizeof(display))) {
         peer = dial;
+        region_peer = info.sender;
     } else if (info.message_type == 0x82) {
         /* A gateway number is not the author of this MMS. A non-dialable
          * mapping keeps the notification linkable without replying to it. */
@@ -364,7 +369,7 @@ static bool deliver_mms_notice(modem_t *m, const char *peer, time_t ts, const ch
     char out[280];
     bool synced = false;
     time_t display_ts = sms_display_time(m, ts, &synced);
-    int formatted = cmd_policy_format_message_notice(out, sizeof(out), "彩信", peer,
+    int formatted = cmd_policy_format_message_notice(out, sizeof(out), "彩信", peer, region_peer,
                     cmd_slot_number(m->idx), display_ts, synced, NULL);
     if (formatted < 0 || (size_t)formatted >= sizeof(out)) {
         if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
@@ -490,7 +495,7 @@ static int sms_process_index(modem_t *m, int idx)
         return 0; /* assembly owns this SIM entry until delivery succeeds */
     } else {
         ok = d.mms_notification ? deliver_mms_notice(m, d.sender, d.scts, d.text, true) :
-             deliver(m, d.sender, d.scts, d.text, true, 1, 1);
+             deliver(m, d.sender, d.sender_is_phone, d.scts, d.text, true, 1, 1);
     }
 
     if (ok) {

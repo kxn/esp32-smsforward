@@ -7,6 +7,8 @@
 #include <ctype.h>
 #include <time.h>
 
+#include "phone_region.h"
+
 static inline bool cmd_policy_dial_number(const char *raw, char *dial, size_t dial_len,
                                           char *display, size_t display_len)
 {
@@ -171,9 +173,11 @@ static inline void cmd_policy_display_phone(const char *raw, char *out, size_t o
         snprintf(out,outlen,"%s",raw);
 }
 
+/* region_peer is the original phone address, or NULL if the origin is unknown. */
 static inline int cmd_policy_format_message_notice(char *out, size_t outlen,
                                                     const char *kind,
                                                     const char *peer,
+                                                    const char *region_peer,
                                                     const char *local_number,
                                                     time_t ts, bool time_synced,
                                                     const char *body)
@@ -182,10 +186,12 @@ static inline int cmd_policy_format_message_notice(char *out, size_t outlen,
     char peer_text[48], local_text[48], timebuf[32];
     cmd_policy_display_phone(peer,peer_text,sizeof(peer_text));
     cmd_policy_display_phone(local_number,local_text,sizeof(local_text));
+    const char *region = phone_region_lookup(region_peer);
     struct tm tmv;
     if (!localtime_r(&ts,&tmv) || !strftime(timebuf,sizeof(timebuf),"%Y-%m-%d %H:%M:%S",&tmv)) return -1;
-    return snprintf(out,outlen,"【收到来自%s的%s】\n接收号码：%s\n接收时间：%s%s%s%s",
-                    peer_text,kind,local_text,timebuf,time_synced?"":"?",
+    return snprintf(out,outlen,"【收到来自%s%s%s%s的%s】\n接收号码：%s\n接收时间：%s%s%s%s",
+                    peer_text,region?"（":"",region?region:"",region?"）":"",
+                    kind,local_text,timebuf,time_synced?"":"?",
                     body && body[0]?"\n\n":"",body?body:"");
 }
 
@@ -201,10 +207,12 @@ static inline int cmd_policy_format_call_notice(char *out, size_t outlen, int sl
     char caller_text[48], local_text[48], timebuf[32];
     cmd_policy_display_phone(caller,caller_text,sizeof(caller_text));
     cmd_policy_display_phone(local_number,local_text,sizeof(local_text));
+    const char *region = phone_region_lookup(caller);
     struct tm tmv;
     if (!localtime_r(&ring_time,&tmv) || !strftime(timebuf,sizeof(timebuf),"%Y-%m-%d %H:%M:%S",&tmv)) return -1;
-    return snprintf(out,outlen,"【接到来自%s的来电】\n接收号码：%s\n接收时间：%s%s",
-                    caller_text,local_text,timebuf,time_synced?"":"?");
+    return snprintf(out,outlen,"【接到来自%s%s%s%s的来电】\n接收号码：%s\n接收时间：%s%s",
+                    caller_text,region?"（":"",region?region:"",region?"）":"",
+                    local_text,timebuf,time_synced?"":"?");
 }
 enum {
     CMD_SMS_RECEIPT_SENT=0,

@@ -141,12 +141,14 @@ bool map_lookup_sim(const char *msg_id, int *slot, char *peer, size_t peerlen,
 /* ---------------- 格式化 ---------------- */
 
 int fmt_incoming(char *out, size_t outlen, int slot, const char *slot_name,
-                 const char *local_num, const char *peer, time_t ts, bool time_synced,
+                 const char *local_num, const char *peer, bool sender_is_phone,
+                 time_t ts, bool time_synced,
                  const char *text)
 {
     (void)slot;
     (void)slot_name;
-    return cmd_policy_format_message_notice(out,outlen,"短信",peer,local_num,ts,time_synced,text);
+    return cmd_policy_format_message_notice(out,outlen,"短信",peer,
+            sender_is_phone ? peer : NULL,local_num,ts,time_synced,text);
 }
 
 /* ---------------- 指令 ---------------- */
@@ -509,8 +511,8 @@ int cmd_selftest(char *report, size_t report_len)
     char buf[512];
 
     int n = fmt_incoming(buf, sizeof(buf), 0, "卡1", "+8615550000001",
-                         "+8615550000002", 1763900000, true, "第一行\n第二行");
-    bool ok = strstr(buf, "【收到来自15550000002的短信】") &&
+                         "10690000", true, 1763900000, true, "第一行\n第二行");
+    bool ok = strstr(buf, "【收到来自10690000的短信】") &&
               strstr(buf, "接收号码：15550000001") && strstr(buf, "接收时间：") &&
               strstr(buf, "第一行\n第二行");
     if (!ok) fails++;
@@ -536,10 +538,10 @@ int cmd_selftest(char *report, size_t report_len)
     k=snprintf(report+used,report_len-used,"[%s] 完整号码选卡与目标归一化\n",ok?"PASS":"FAIL");
     used+=k>0?k:0;
 
-    fmt_incoming(buf,sizeof(buf),0,"卡1","15550000001","13800138000",1763900000,true,"x");
+    fmt_incoming(buf,sizeof(buf),0,"卡1","15550000001","+12025550123",true,1763900000,true,"x");
     struct tm local_tm; char expected_time[32]; time_t test_ts=1763900000;
     localtime_r(&test_ts,&local_tm); strftime(expected_time,sizeof(expected_time),"%Y-%m-%d %H:%M:%S",&local_tm);
-    ok=strstr(buf,"【收到来自13800138000的短信】")!=NULL &&
+    ok=strstr(buf,"【收到来自+12025550123的短信】")!=NULL &&
        strstr(buf,"接收号码：15550000001")!=NULL && strstr(buf,expected_time)!=NULL &&
        strstr(buf,"****")==NULL;
     if(!ok) fails++;
@@ -547,8 +549,8 @@ int cmd_selftest(char *report, size_t report_len)
     used+=k>0?k:0;
 
     ok=cmd_policy_format_call_notice(buf,sizeof(buf),1,"工作卡","+8615550000002",
-                                     "+8615550000001",1763900000,true)>0 &&
-       strstr(buf,"【接到来自15550000001的来电】") && strstr(buf,"接收号码：15550000002") &&
+                                     "10086",1763900000,true)>0 &&
+       strstr(buf,"【接到来自10086的来电】") && strstr(buf,"接收号码：15550000002") &&
        strstr(buf,"接收时间：") && !strstr(buf,"卡槽") && !strstr(buf,"自动挂断") && !strstr(buf,"呼转");
     if(!ok) fails++;
     k=snprintf(report+used,report_len-used,"[%s] 来电通知字段\n",ok?"PASS":"FAIL");

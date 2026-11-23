@@ -12,6 +12,7 @@ typedef struct {
     char text[PDU_TEXT_MAX]; /* UTF-8 */
     int dcs;
     bool has_udh;
+    bool sender_is_phone; /* numeric originator with a valid TP-OA encoding */
     bool mms_notification; /* WAP Push destination port 2948 */
     bool binary_payload_hex; /* 8-bit multipart payload encoded as hex for safe string assembly */
     int concat_ref;

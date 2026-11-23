@@ -23,6 +23,7 @@ typedef struct {
     bool oversized;
     bool mms_notification;
     bool binary_payload_hex;
+    bool sender_is_phone;
     bool timestamp_from_sequence_one;
     int slot;
     int reference;
@@ -52,7 +53,7 @@ void sms_assembly_init(sms_assembly_pool_t *pool);
 void sms_assembly_destroy(sms_assembly_pool_t *pool);
 sms_assembly_status_t sms_assembly_add(sms_assembly_pool_t *pool, int slot,
     const char *sender, int reference, int reference_width, int total, int sequence,
-    time_t timestamp, bool mms_notification, bool binary_payload_hex,
+    time_t timestamp, bool mms_notification, bool binary_payload_hex, bool sender_is_phone,
     int sim_index, uint64_t identity, const char *text,
     uint64_t now_ms, unsigned timeout_ms, int *assembly_index);
 /* Returns 1 when ready, 0 when incomplete/not timed out, negative on bounds error. */
