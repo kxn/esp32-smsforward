@@ -18,9 +18,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
-#include <unistd.h>
-#include <errno.h>
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -35,19 +34,8 @@ static modem_t *s_modems;
 static SemaphoreHandle_t s_config_lock[MODEM_COUNT];
 static bool s_slot_configured[MODEM_COUNT];
 
-static sms_seen_store_t s_seen;
+static EXT_RAM_BSS_ATTR sms_seen_store_t s_seen;
 static SemaphoreHandle_t s_delivery_lock;
-
-bool sms_clear_persistent_dedup(void)
-{
-    if (!s_seen.path[0]) return false;
-    if (s_delivery_lock) xSemaphoreTake(s_delivery_lock, portMAX_DELAY);
-    bool ok = unlink(s_seen.path) == 0 || errno == ENOENT;
-    if (ok) ok = sms_seen_init(&s_seen, "/data/sms_seen.dat");
-    if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
-    return ok;
-}
-
 
 static int64_t sms_days_from_civil(int y, unsigned m, unsigned d)
 {
@@ -149,7 +137,7 @@ enum { SMS_JOB_READ = 1, SMS_JOB_SCAN_START, SMS_JOB_SCAN_STEP, SMS_JOB_FLUSH, S
 /* ---------------- 闀跨煭淇℃嫾鎺?---------------- */
 
 #define CONCAT_TIMEOUT_MS 60000
-static sms_assembly_pool_t s_concat;
+static EXT_RAM_BSS_ATTR sms_assembly_pool_t s_concat;
 static SemaphoreHandle_t s_concat_lock;
 
 static bool deliver(modem_t *m, const char *peer, time_t ts, const char *text,
@@ -652,9 +640,9 @@ void sms_urc(modem_t *m, const char *line)
     /* URCs may contain SMS payloads or caller numbers; never log raw lines. */
 }
 
-static void sms_task(void *arg)
+void sms_run(void)
 {
-    (void)arg;
+    vTaskPrioritySet(NULL, 9);
     sms_job_t job;
     bool scanning[MODEM_COUNT] = {0};
     TickType_t watermark_log_at = 0;
@@ -791,8 +779,7 @@ esp_err_t sms_init(modem_t *modems)
         return ESP_ERR_NO_MEM;
     sms_assembly_init(&s_concat);
     if (!sms_seen_init(&s_seen, "/data/sms_seen.dat")) return ESP_FAIL;
-    if (xTaskCreate(sms_task, "sms", 24576, NULL, 9, NULL) != pdPASS ||
-        xTaskCreate(ring_task, "ring", 12288, NULL, 9, NULL) != pdPASS ||
+    if (xTaskCreate(ring_task, "ring", 12288, NULL, 9, NULL) != pdPASS ||
         xTaskCreate(concat_timer_task, "concat", 3072, NULL, 5, NULL) != pdPASS ||
         xTaskCreate(sms_retry_task, "sms_retry", 3072, NULL, 2, NULL) != pdPASS) {
         ESP_LOGE(TAG, "required SMS worker creation failed");

@@ -62,6 +62,7 @@ esp_err_t feishu_reply_text(const char *parent_id, const char *text,
 esp_err_t feishu_ws_start(void);
 void feishu_ws_stop(void);
 bool feishu_ws_connected(void);
+bool feishu_ws_authenticated_for(const char *app_id, const char *app_secret);
 int feishu_ws_reconnects(void);
 /* 供 URC/任务调用：记录推送目标（最近一次给机器人发消息的人） */
 void feishu_learn_peer(const char *open_id, const char *chat_id);

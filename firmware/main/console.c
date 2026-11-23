@@ -9,6 +9,7 @@
 #include "wifi.h"
 #include "ble.h"
 #include "modem_timing.h"
+#include "power_policy.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_app_desc.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
@@ -51,6 +53,9 @@ static void cmd_info(void)
            (unsigned long)heap_caps_get_total_size(MALLOC_CAP_INTERNAL));
     printf("heap psram: %lu free\n", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     printf("uptime   : %lu s\n", (unsigned long)(xTaskGetTickCount() / 1000));
+    char power[96];
+    power_policy_status(power, sizeof(power));
+    printf("power    : %s\n", power);
     for (int i = 0; i < MODEM_COUNT; i++) {
         printf("modem%d   : uart%d tx%d rx%d rst%d ready=%d\n", i + 1,
                s_modems[i].uart, s_modems[i].pin.tx, s_modems[i].pin.rx,
@@ -328,6 +333,7 @@ static void cmd_help(void)
 {
     printf("\n"
            "info            设备信息\n"
+           "power           电源策略及当前时钟\n"
            "m1 <AT>         向模组1发 AT\n"
            "m2 <AT>         向模组2发 AT\n"
            "p1 / p2 / pa    探活序列（pa=两张卡）\n"
@@ -346,6 +352,16 @@ static void handle_line(char *line)
         cmd_help();
     } else if (!strcmp(line, "info")) {
         cmd_info();
+    } else if (!strcmp(line, "power")) {
+        char status[96];
+        power_policy_status(status, sizeof(status));
+        printf("%s\n", status);
+#if CONFIG_PM_PROFILING
+        esp_err_t err = esp_pm_dump_locks(stdout);
+        if (err != ESP_OK) printf("PM profile unavailable: %s\n", esp_err_to_name(err));
+#else
+        printf("PM profiling disabled\n");
+#endif
     } else if (!strncmp(line, "m1 ", 3)) {
         run_at(&s_modems[0], line + 3, 5000);
     } else if (!strncmp(line, "m2 ", 3)) {
@@ -422,7 +438,10 @@ static void console_task(void *arg)
     fflush(stdout);
 
     while (1) {
-        int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(100));
+        /* read_bytes waits for any queued USB data (not for the full buffer),
+         * so block indefinitely instead of polling the console ten times a
+         * second while the user is idle. */
+        int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
         for (int i = 0; i < n; i++) {
             char c = (char)buf[i];
             if (c == '\r') continue;

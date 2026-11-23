@@ -156,7 +156,15 @@ static void rx_task(void *arg)
     uint8_t buf[256];
 
     while (1) {
-        int n = uart_read_bytes(m->uart, buf, sizeof(buf), pdMS_TO_TICKS(50));
+        /* Read exactly one byte with an infinite wait: uart_read_bytes waits
+         * for the requested count, so asking for the full buffer would delay
+         * short URCs until it filled. Drain any bytes already queued without
+         * blocking after the first byte wakes this task. */
+        int n = uart_read_bytes(m->uart, buf, 1, portMAX_DELAY);
+        if (n > 0) {
+            int extra = uart_read_bytes(m->uart, buf + n, sizeof(buf) - n, 0);
+            if (extra > 0) n += extra;
+        }
         for (int i = 0; i < n; i++) {
             rx_char(m, (char)buf[i]);
         }
@@ -189,7 +197,10 @@ esp_err_t modem_init(modem_t *m, int idx)
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        /* The default is APB and changes under DFS. The modems can send
+         * URCs at any time, so their UART clock must not depend on a PM lock
+         * held only during commands. XTAL is stable through DFS. */
+        .source_clk = UART_SCLK_XTAL,
     };
 
     ESP_ERROR_CHECK(uart_driver_install(m->uart, 4096, 2048, 0, NULL, 0));

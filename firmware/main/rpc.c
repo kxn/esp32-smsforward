@@ -7,8 +7,9 @@
 #include "cmd.h"
 #include "cmd_policy.h"
 #include "device_status.h"
+#include "factory_reset.h"
 #include "runtime.h"
-#include "sms.h"
+#include "telemetry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,22 @@ esp_err_t rpc_init(void)
     /* Called during single-threaded service startup by BLE and LAN. */
     if (!s_rpc_lock) s_rpc_lock = xSemaphoreCreateMutex();
     return s_rpc_lock ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+bool rpc_complete_setup(void)
+{
+    if (!s_rpc_lock || xSemaphoreTake(s_rpc_lock, 0) != pdTRUE) return false;
+    bool complete = false;
+    if (!factory_reset_pending()) {
+        app_cfg_t saved;
+        complete = cfg_setup_done() ||
+                   (wifi_connected() && feishu_ws_connected() &&
+                    cfg_read_setup_credentials(&saved) == ESP_OK && wifi_online_for(&saved) &&
+                    feishu_ws_authenticated_for(saved.app_id, saved.app_secret) &&
+                    cfg_commit_setup(&saved) == ESP_OK);
+    }
+    xSemaphoreGive(s_rpc_lock);
+    return complete;
 }
 
 static const char *json_string(cJSON *root, const char *key, bool *present)
@@ -75,6 +92,66 @@ static bool valid_wifi_config(const app_cfg_t *cfg)
            valid_ipv4(cfg->gw) && valid_ipv4(dns);
 }
 
+static const char *telemetry_state_name(telemetry_state_t state)
+{
+    switch (state) {
+    case TELEMETRY_OK: return "ok";
+    case TELEMETRY_WARMING_UP: return "warming_up";
+    case TELEMETRY_UNSUPPORTED: return "unsupported";
+    case TELEMETRY_OUT_OF_RANGE: return "out_of_range";
+    default: return "unavailable";
+    }
+}
+
+static cJSON *telemetry_data(void)
+{
+    telemetry_snapshot_t sample;
+    telemetry_read(&sample);
+    cJSON *data = cJSON_CreateObject();
+    if (!data) return NULL;
+    cJSON *cpu = cJSON_AddObjectToObject(data, "cpu");
+    if (!cpu) { cJSON_Delete(data); return NULL; }
+    cJSON_AddStringToObject(cpu, "state", telemetry_state_name(sample.cpu.state));
+    cJSON_AddStringToObject(cpu, "source", "freertos_idle_task");
+    if (sample.cpu.state == TELEMETRY_OK) {
+        cJSON *cores = cJSON_AddArrayToObject(cpu, "core_pct");
+        if (!cores) { cJSON_Delete(data); return NULL; }
+        for (unsigned i = 0; i < sample.cpu.cores; ++i) {
+            cJSON *percent = cJSON_CreateNumber(sample.cpu.core_pct[i]);
+            if (!percent) { cJSON_Delete(data); return NULL; }
+            cJSON_AddItemToArray(cores, percent);
+        }
+        cJSON_AddNumberToObject(cpu, "used_pct", sample.cpu.used_pct);
+        cJSON_AddNumberToObject(cpu, "window_ms", sample.cpu.window_ms);
+        cJSON_AddNumberToObject(cpu, "age_ms", sample.cpu.age_ms);
+    } else {
+        cJSON_AddNullToObject(cpu, "core_pct");
+        cJSON_AddNullToObject(cpu, "used_pct");
+        cJSON_AddNullToObject(cpu, "window_ms");
+        cJSON_AddNullToObject(cpu, "age_ms");
+    }
+    cJSON_AddStringToObject(data, "temperature_state", telemetry_state_name(sample.temperature_state));
+    if (sample.temperature_state == TELEMETRY_OK) {
+        cJSON_AddNumberToObject(data, "temperature_c", sample.temperature_c);
+        cJSON_AddNumberToObject(data, "temperature_age_ms", sample.temperature_age_ms);
+    } else {
+        cJSON_AddNullToObject(data, "temperature_c");
+        cJSON_AddNullToObject(data, "temperature_age_ms");
+    }
+    cJSON_AddNumberToObject(data, "uptime_s", (double)sample.uptime_s);
+    cJSON_AddNumberToObject(data, "heap_free_bytes", sample.heap_free_bytes);
+    cJSON_AddNumberToObject(data, "heap_total_bytes", sample.heap_total_bytes);
+    cJSON_AddNumberToObject(data, "heap_min_free_bytes", sample.heap_min_free_bytes);
+    if (sample.psram_total_bytes) {
+        cJSON_AddNumberToObject(data, "psram_free_bytes", sample.psram_free_bytes);
+        cJSON_AddNumberToObject(data, "psram_total_bytes", sample.psram_total_bytes);
+    } else {
+        cJSON_AddNullToObject(data, "psram_free_bytes");
+        cJSON_AddNullToObject(data, "psram_total_bytes");
+    }
+    return data;
+}
+
 static cJSON *status_data(void)
 {
     const app_cfg_t *cfg = cfg_get();
@@ -104,8 +181,10 @@ static cJSON *status_data(void)
         else cJSON_AddNullToObject(slot, "csq");
         cJSON_AddItemToArray(slots, slot);
     }
-    cJSON_AddStringToObject(feishu, "state", feishu_ws_connected() ? "online" : "offline");
+    cJSON_AddBoolToObject(data, "setup_done", cfg_setup_done());
+    cJSON_AddStringToObject(feishu, "state", feishu_ws_authenticated_for(cfg->app_id, cfg->app_secret) ? "online" : "offline");
     cJSON_AddBoolToObject(feishu, "configured", feishu_configured());
+    cJSON_AddBoolToObject(feishu, "bound", cfg->open_id[0] || cfg->chat_id[0]);
     cJSON_AddStringToObject(feishu, "app_id", cfg->app_id);
     cJSON_AddStringToObject(wifi, "ssid", ssid);
     cJSON_AddStringToObject(wifi, "ip", ip);
@@ -158,11 +237,24 @@ static bool mutating_command(const char *cmd)
 {
     return !strcmp(cmd, "wifi_set") || !strcmp(cmd, "feishu_set") ||
            !strcmp(cmd, "slot_set") || !strcmp(cmd, "tz_set") ||
-           !strcmp(cmd, "reboot") || !strcmp(cmd, "factory_reset");
+           !strcmp(cmd, "reboot");
+}
+
+static bool explicit_reset_confirmation(cJSON *request)
+{
+    bool confirmed = false;
+    cJSON *field;
+    cJSON_ArrayForEach(field, request) {
+        if (field->string && strcmp(field->string, "confirm") == 0) {
+            if (confirmed || !cJSON_IsTrue(field)) return false;
+            confirmed = true;
+        }
+    }
+    return confirmed;
 }
 
 esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response_len,
-                            bool require_physical, rpc_post_reply_action_t *post_action)
+                            bool via_ble, rpc_post_reply_action_t *post_action)
 {
     if (post_action) *post_action = RPC_POST_NONE;
     if (response && response_len) response[0] = '\0';
@@ -172,7 +264,7 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
         return ESP_ERR_INVALID_STATE;
     }
 
-    cJSON *root = cJSON_Parse(request);
+    cJSON *root = cJSON_ParseWithOpts(request, NULL, true);
     if (!root || !cJSON_IsObject(root)) {
         cJSON_Delete(root);
         return error_reply(0, "json", response, response_len);
@@ -195,10 +287,28 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
     cJSON *data = NULL;
     const char *err = NULL;
 
-    if (require_physical && mutating_command(cmd) && !ble_physical_presence_active()) {
+    if (factory_reset_pending()) {
+        err = "reset_pending";
+    } else if (!strcmp(cmd, "factory_reset")) {
+        if (via_ble) err = "lan_required";
+        else if (!explicit_reset_confirmation(root)) err = "confirm_required";
+        else if (factory_reset_request() != ESP_OK) err = "reset_storage_failed";
+        else *post_action = RPC_POST_RESTART;
+    } else if (via_ble && mutating_command(cmd) && !ble_physical_presence_active()) {
         err = "physical_presence_required";
     } else if (!strcmp(cmd, "status")) {
         data = status_data();
+        if (data && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "telemetry"))) {
+            cJSON *sample = telemetry_data();
+            if (!sample || !cJSON_AddItemToObject(data, "telemetry", sample)) {
+                cJSON_Delete(sample);
+                cJSON_Delete(data);
+                data = NULL;
+            }
+        }
+        if (!data) err = "memory";
+    } else if (!strcmp(cmd, "telemetry")) {
+        data = telemetry_data();
         if (!data) err = "memory";
     } else if (!strcmp(cmd, "wifi_scan")) {
         char *scan = malloc(4096);
@@ -302,19 +412,6 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
         }
     } else if (!strcmp(cmd, "reboot")) {
         if (post_action) *post_action = RPC_POST_RESTART;
-    } else if (!strcmp(cmd, "factory_reset")) {
-        if (!cmd_clear_persistent_map() || !sms_clear_persistent_dedup()) err = "reset_storage_failed";
-        else {
-            app_cfg_t backup = *cfg_get();
-            cfg_defaults();
-            if (cfg_save() != ESP_OK) { *cfg_mut() = backup; err = "save_failed"; }
-            else {
-                cfg_apply_timezone();
-                feishu_cfg_t empty = {0};
-                (void)feishu_init(&empty);
-                if (post_action) *post_action = RPC_POST_RESTART;
-            }
-        }
     } else {
         err = "unknown";
     }
@@ -339,6 +436,10 @@ void rpc_run_post_reply_action(rpc_post_reply_action_t action)
     if (action == RPC_POST_WIFI_RECONFIGURE) {
         if (!s_rpc_lock) return;
         xSemaphoreTake(s_rpc_lock, portMAX_DELAY);
+        if (factory_reset_pending()) {
+            xSemaphoreGive(s_rpc_lock);
+            return;
+        }
         app_cfg_t snapshot = *cfg_get();
         xSemaphoreGive(s_rpc_lock);
         esp_err_t err = wifi_reconfigure(&snapshot);

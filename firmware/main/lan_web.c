@@ -1,5 +1,6 @@
 #include "lan_web.h"
 
+#include "factory_reset.h"
 #include "rpc.h"
 #include "wifi.h"
 
@@ -251,7 +252,7 @@ void lan_web_stop(void)
 
 bool lan_web_management_url(char *out, size_t cap)
 {
-    if (!out || !cap || !wifi_connected() || !s_lock) return false;
+    if (!out || !cap || factory_reset_pending() || !wifi_connected() || !s_lock) return false;
     char ssid[40] = {0}, ip[20] = {0};
     wifi_status(ssid, sizeof(ssid), ip, sizeof(ip), NULL);
     if (!ip[0]) return false;

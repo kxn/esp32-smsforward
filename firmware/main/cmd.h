@@ -33,7 +33,6 @@ void cmd_handle(const char *open_id, const char *chat_id, const char *text,
 int cmd_selftest(char *report, size_t report_len);
 
 void cmd_init(void *modems);
-bool cmd_clear_persistent_map(void);
 void cmd_set_slot(int slot, const char *name, const char *number);
 /* Refresh this SIM's current number from CNUM/CPBR; never return a stale cache on error. */
 esp_err_t cmd_refresh_slot_number(int slot, char *number, size_t number_len);

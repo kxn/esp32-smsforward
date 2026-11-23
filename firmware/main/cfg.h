@@ -29,5 +29,11 @@ esp_err_t cfg_init(void);
 const app_cfg_t *cfg_get(void);
 app_cfg_t *cfg_mut(void);
 esp_err_t cfg_save(void);
+bool cfg_setup_done(void);
+esp_err_t cfg_read_setup_credentials(app_cfg_t *out);
+/* Commit only when the already checked connection uses the saved credentials. */
+esp_err_t cfg_commit_setup(const app_cfg_t *expected);
+/* Startup reset recovery only. */
+esp_err_t cfg_erase_persisted(void);
 void cfg_apply_timezone(void);
 void cfg_defaults(void);

@@ -17,6 +17,10 @@ BLE_STUB = r"""
 (() => {
   const state = window.mockBle = {
     failNext: null,
+    telemetryCount: 0,
+    telemetryDelayMs: 0,
+    telemetryUnsupported: false,
+    setupDone: false,
     slots: [
       { n: 1, name: '主卡', num: '13800138000', reg: true, op: '中国移动', csq: 23 },
       { n: 2, name: '备用卡', num: '卡2-123456', reg: false, op: '', csq: null }
@@ -42,9 +46,24 @@ BLE_STUB = r"""
       let reply;
       if (state.failNext) { const err = state.failNext; state.failNext = null; reply = { id: req.id, ok: false, err }; }
       else if (req.cmd === 'status') reply = { id: req.id, ok: true, data: {
-        slots: state.slots, wifi: state.wifi, feishu: state.fs,
+        setup_done: state.setupDone, slots: state.slots, wifi: state.wifi, feishu: state.fs,
         time: { synced: true, utc: 1763900000, tz: state.tz }
       }};
+      else if (req.cmd === 'telemetry') {
+        const count = ++state.telemetryCount;
+        if (state.telemetryUnsupported) reply = { id: req.id, ok: false, err: 'unknown' };
+        else reply = { id: req.id, ok: true, data: {
+          cpu: count === 1 ? { state: 'warming_up', used_pct: null, window_ms: null }
+            : { state: 'ok', used_pct: 20 + count, core_pct: [15, 30], window_ms: 5000 },
+          temperature_c: 41.2, temperature_state: 'ok', heap_free_bytes: 327680,
+          heap_total_bytes: 524288, psram_free_bytes: 6291456, psram_total_bytes: 8388608,
+          uptime_s: 3661
+        }};
+        if (state.telemetryDelayMs) {
+          setTimeout(() => this.deliver(reply), state.telemetryDelayMs);
+          return;
+        }
+      }
       else if (req.cmd === 'wifi_set') {
         state.wifi = { ...state.wifi, cfg_ssid: req.ssid, ssid: req.ssid, dhcp: req.dhcp,
           ip: req.dhcp ? '192.168.1.88' : req.ip, cfg_ip: req.ip, mask: req.mask, gw: req.gw, dns: req.dns };
@@ -58,6 +77,9 @@ BLE_STUB = r"""
       } else if (req.cmd === 'tz_set') { state.tz = req.offset; reply = { id: req.id, ok: true }; }
       else if (req.cmd === 'wifi_scan') reply = { id: req.id, ok: true, data: [{ ssid: 'Studio', rssi: -51 }] };
       else reply = { id: req.id, ok: true };
+      this.deliver(reply);
+    }
+    deliver(reply) {
       const raw = new TextEncoder().encode(JSON.stringify(reply) + '\n');
       // Small chunks deliberately split UTF-8 characters and JSON tokens.
       for (let i = 0; i < raw.length; i += 11) {
@@ -115,6 +137,22 @@ class LanHandler(Handler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
+        if request.get("cmd") == "telemetry":
+            self.server.telemetry_count += 1
+            self._json(200, {"id": request.get("id"), "ok": True, "data": {
+                "cpu": {"state": "ok", "used_pct": 26.7, "window_ms": 5000},
+                "temperature_c": None, "temperature_state": "unsupported",
+                "heap_free_bytes": 204800, "heap_total_bytes": 524288, "uptime_s": 120,
+            }})
+            return
+        if request.get("cmd") == "factory_reset":
+            self.server.factory_requests.append(request)
+            confirmed = request.get("confirm") is True
+            response = {"id": request.get("id"), "ok": confirmed}
+            if not confirmed:
+                response["err"] = "confirm_required"
+            self._json(200, response)
+            return
         if request.get("cmd") != "status":
             self._json(200, {"id": request.get("id"), "ok": True})
             return
@@ -142,6 +180,8 @@ def start_lan_server(token):
     server = ThreadingHTTPServer(("127.0.0.1", 0), LanHandler)
     server.expected_token = token
     server.auth_headers = []
+    server.telemetry_count = 0
+    server.factory_requests = []
     server.available = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -162,11 +202,38 @@ def test_lan_mode(browser) -> None:
         assert page.get_by_text("LAN 主卡", exact=True).is_visible()
         assert page.locator("#lanGate").is_hidden()
         assert page.locator("#btnConnect").is_hidden()
+        assert page.locator("#provisionGuide").is_hidden()
         if "token=" in page.url:
             raise AssertionError("management token remained in URL")
         assert page.evaluate("sessionStorage.length") == 1
+        page.get_by_text("26.7%", exact=True).wait_for()
+        assert page.locator("#temperatureDetail").inner_text() == "该设备未提供传感器"
+        assert first.telemetry_count == 1
         if not first.auth_headers or not all(h == "Bearer " + token for h in first.auth_headers):
             raise AssertionError("LAN authorization header mismatch")
+
+        # Leaving the overview aborts an in-flight LAN monitor fetch.
+        page.evaluate("""() => {
+            const original = window.fetch;
+            window.delayedTelemetry = 0;
+            window.cancelledTelemetry = 0;
+            window.fetch = (url, options) => {
+                if (url !== '/api/rpc' || JSON.parse(options.body).cmd !== 'telemetry')
+                    return original(url, options);
+                ++window.delayedTelemetry;
+                return new Promise((resolve, reject) => {
+                    options.signal.addEventListener('abort', () => {
+                        ++window.cancelledTelemetry;
+                        reject(new DOMException('Aborted', 'AbortError'));
+                    }, { once: true });
+                });
+            };
+        }""")
+        page.get_by_role("button", name="网络", exact=True).click()
+        page.get_by_role("button", name="设备概览", exact=True).click()
+        page.wait_for_function("window.delayedTelemetry === 1")
+        page.get_by_role("button", name="网络", exact=True).click()
+        page.wait_for_function("window.cancelledTelemetry === 1")
 
         # The token survives a same-tab reload only in this origin's session storage.
         page.reload()
@@ -208,12 +275,114 @@ def test_lan_mode(browser) -> None:
         assert page.evaluate("sessionStorage.length") == 0
         if "token=" in page.url:
             raise AssertionError("expired management token remained in URL")
-        print("PASS LAN /api/info detection, fragment cleanup, Bearer RPC, reload, expired token, and origin isolation")
+        assert page.locator("#btnFactory").is_hidden()
+
+        first.expected_token = token
+        page.goto(first_url)
+        page.locator("#view-overview").wait_for(state="visible")
+        test_factory_reset(page, first)
+        print("PASS LAN detection, fragment cleanup, Bearer RPC, telemetry cancellation, token isolation, and factory reset confirmation")
     finally:
         page.close()
         for server in (first, second, ble):
             server.shutdown()
             server.server_close()
+
+
+def test_factory_reset(page, server) -> None:
+    page.get_by_role("button", name="系统", exact=True).click()
+    reset = page.get_by_role("button", name="恢复出厂设置", exact=True)
+    dialog = page.get_by_role("dialog", name="恢复出厂设置？")
+    cancel = dialog.get_by_role("button", name="取消", exact=True)
+
+    reset.click()
+    assert dialog.is_visible()
+    assert cancel.evaluate("el => el === document.activeElement")
+    page.keyboard.press("Enter")
+    assert dialog.is_hidden()
+
+    reset.click()
+    page.keyboard.press("Escape")
+    assert dialog.is_hidden()
+
+    reset.click()
+    cancel.click()
+    assert dialog.is_hidden()
+    assert not server.factory_requests
+
+    reset.click()
+    dialog.get_by_role("button", name="确认恢复出厂", exact=True).evaluate("""button => {
+        const form = button.form;
+        button.click();
+        form.requestSubmit(button);
+    }""")
+    page.get_by_text("设备正在重启。请打开蓝牙配置页重新配网。", exact=True).wait_for()
+    assert len(server.factory_requests) == 1
+    assert server.factory_requests[0]["confirm"] is True
+    assert page.evaluate("sessionStorage.length") == 0
+
+
+def test_ble_provision_guide(page) -> None:
+    title = page.locator("#provisionTitle")
+    assert title.inner_text() == "接下来使用局域网管理"
+    page.evaluate("""() => {
+        const {wifi, fs} = window.mockBle;
+        window.savedWifi = {...wifi};
+        window.savedFs = {...fs};
+        wifi.ip = '';
+        return refresh();
+    }""")
+    assert title.inner_text() == "连接 Wi-Fi"
+    page.evaluate("window.mockBle.wifi = window.savedWifi; window.mockBle.fs.configured = false; refresh()")
+    assert title.inner_text() == "配置飞书"
+    page.evaluate("window.mockBle.fs.configured = true; window.mockBle.fs.state = 'offline'; refresh()")
+    assert title.inner_text() == "等待飞书上线"
+    page.evaluate("window.mockBle.setupDone = true; refresh()")
+    assert title.inner_text() == "蓝牙恢复配置"
+    assert "120 秒" in page.locator("#provisionText").inner_text()
+    page.evaluate("window.mockBle.setupDone = false; window.mockBle.fs = window.savedFs; refresh()")
+    assert title.inner_text() == "接下来使用局域网管理"
+
+
+def test_ble_monitor(page) -> None:
+    page.get_by_text("等待首个完整采样窗口", exact=True).wait_for()
+    assert page.locator("#temperatureValue").inner_text() == "41.2 °C"
+    assert page.locator("#heapValue").inner_text() == "320 KiB / 512 KiB"
+    assert page.locator("#uptimeValue").inner_text() == "1 小时 1 分"
+    def count():
+        return page.evaluate("window.mockBle.telemetryCount")
+
+    assert count() == 1
+    page.clock.run_for(5100)
+    assert count() == 2
+    assert page.locator("#cpuValue").inner_text() == "22.0%"
+    assert "5 秒采样窗口" in page.locator("#cpuDetail").inner_text()
+
+    # A slow reply cannot start a second poll, and leaving the view discards it.
+    page.evaluate("window.mockBle.telemetryDelayMs = 7500")
+    page.clock.run_for(10200)
+    assert count() == 3
+    page.get_by_role("button", name="网络", exact=True).click()
+    page.clock.run_for(9000)
+    assert count() == 3
+    assert page.locator("#cpuValue").text_content() == "22.0%"
+
+    # Resuming is immediate and a hidden document stops the monitoring timer.
+    page.evaluate("window.mockBle.telemetryDelayMs = 0")
+    page.get_by_role("button", name="设备概览", exact=True).click()
+    page.get_by_text("24.0%", exact=True).wait_for()
+    page.evaluate("""() => {
+        Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+        document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+    page.clock.run_for(15000)
+    assert count() == 4
+    page.evaluate("""() => {
+        delete document.hidden;
+        document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+    page.get_by_text("25.0%", exact=True).wait_for()
+    assert count() == 5
 
 
 def main() -> None:
@@ -223,6 +392,7 @@ def main() -> None:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.clock.install()
             page.add_init_script(BLE_STUB)
             page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
 
@@ -240,6 +410,8 @@ def main() -> None:
             assert "192.168.1.40" in page.locator("#networkGrid").inner_text()
             assert page.locator("#view-overview").is_visible()
             assert page.locator("#view-network").is_hidden()
+            test_ble_monitor(page)
+            test_ble_provision_guide(page)
 
             page.get_by_role("button", name="网络", exact=True).click()
             assert page.locator("#view-network").is_visible()
@@ -248,7 +420,7 @@ def main() -> None:
             page.evaluate("window.mockBle.failNext='physical_presence_required'")
             page.get_by_role("button", name="保存并连接").click()
             page.get_by_text("按设备 BOOT 键", exact=False).wait_for()
-            page.evaluate("rpc({cmd: 'status'})")
+            page.evaluate("refresh()")
             assert page.locator("#pass").input_value() == "example-secret"
             assert page.locator("#ssid").input_value() == "Studio-5G"
 
@@ -270,6 +442,8 @@ def main() -> None:
             page.get_by_role("button", name="保存卡槽").click()
             page.get_by_text("卡槽配置已保存", exact=False).wait_for()
             page.get_by_role("button", name="系统", exact=True).click()
+            assert page.locator("#btnFactory").is_hidden()
+            assert page.locator("#factoryLanOnly").is_visible()
             page.locator("#tz").fill("9")
             page.get_by_role("button", name="保存时区").click()
             page.get_by_text("时区已保存", exact=False).wait_for()
@@ -293,7 +467,13 @@ def main() -> None:
             page.locator("#toast").evaluate("el => { el.className = ''; el.style.display = 'none'; }")
             page.screenshot(path=str(mobile), full_page=True)
             assert page.get_by_role("button", name="设备概览", exact=True).get_attribute("aria-current") == "page"
-            print(f"PASS: BLE connect, split UTF-8 frames, status readback, provisioning error, network/Feishu/slot/time saves, reconnect, mobile widths")
+            page.evaluate("window.mockBle.telemetryUnsupported = true")
+            page.clock.run_for(5100)
+            assert page.locator("#monitorStatus").inner_text() == "当前固件不提供运行监控"
+            unsupported_count = page.evaluate("window.mockBle.telemetryCount")
+            page.clock.run_for(15000)
+            assert page.evaluate("window.mockBle.telemetryCount") == unsupported_count
+            print("PASS: BLE and LAN monitoring, BLE polling cadence, visibility, request serialization, status, settings, reconnect, mobile widths")
             print(f"Screenshots: {desktop} ; {mobile}")
             test_lan_mode(browser)
             browser.close()

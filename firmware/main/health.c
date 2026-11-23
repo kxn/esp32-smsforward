@@ -26,8 +26,8 @@ static int s_fail[2];
 static volatile int s_blink_sms;
 static volatile int s_blink_err;
 
-void health_sms_blink(void) { s_blink_sms = 3; }
-void health_error_blink(void) { s_blink_err = 6; }
+void health_sms_blink(void) { s_blink_sms = 1; }
+void health_error_blink(void) { s_blink_err = 2; }
 
 static void reinit_modem(modem_t *m)
 {
@@ -98,7 +98,9 @@ static void health_task(void *arg)
             gpio_set_level(PIN_LED2, 0);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(250));
+        /* LED state does not need a 4 Hz polling task. UART URCs are handled
+         * by the independent RX workers, not by this heartbeat. */
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 

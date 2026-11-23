@@ -80,6 +80,9 @@ static void netif_init_once(void)
 
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&ic));
+    /* Keep the station associated while sleeping between AP beacons. This is
+     * also IDF's default, but set it explicitly as part of the device policy. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL));
     s_events = xEventGroupCreate();
@@ -195,6 +198,46 @@ bool wifi_connected(void)
 {
     if (!s_events) return false;
     return (xEventGroupGetBits(s_events) & BIT_GOT_IP) != 0;
+}
+
+bool wifi_online_for(const app_cfg_t *cfg)
+{
+    if (!cfg || !cfg->wifi_ssid[0] || !wifi_connected() || !s_config_lock) return false;
+
+    size_t ssid_len = strnlen(cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
+    size_t pass_len = strnlen(cfg->wifi_pass, sizeof(cfg->wifi_pass));
+    if (ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->sta.ssid) ||
+        pass_len > sizeof(((wifi_config_t *)0)->sta.password)) return false;
+
+    xSemaphoreTake(s_config_lock, portMAX_DELAY);
+    bool online = false;
+    if (s_started && s_configured && wifi_connected()) {
+        wifi_config_t current = {0};
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip = {0};
+        if (esp_wifi_get_config(WIFI_IF_STA, &current) == ESP_OK && netif &&
+            esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+            size_t current_ssid_len = ssid_len < sizeof(current.sta.ssid)
+                ? strnlen((const char *)current.sta.ssid, sizeof(current.sta.ssid))
+                : sizeof(current.sta.ssid);
+            size_t current_pass_len = strnlen((const char *)current.sta.password,
+                                               sizeof(current.sta.password));
+            bool same_ssid = current_ssid_len == ssid_len &&
+                             memcmp(current.sta.ssid, cfg->wifi_ssid, ssid_len) == 0;
+            bool same_pass = current_pass_len == pass_len &&
+                             memcmp(current.sta.password, cfg->wifi_pass, pass_len) == 0;
+            bool same_ip = true;
+            if (!cfg->dhcp) {
+                esp_ip4_addr_t expected = {0};
+                same_ip = cfg->ip[0] &&
+                          esp_netif_str_to_ip4(cfg->ip, &expected) == ESP_OK &&
+                          expected.addr == ip.ip.addr;
+            }
+            online = same_ssid && same_pass && same_ip;
+        }
+    }
+    xSemaphoreGive(s_config_lock);
+    return online;
 }
 
 uint32_t wifi_uptime_seconds(void)

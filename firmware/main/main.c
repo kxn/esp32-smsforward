@@ -30,6 +30,9 @@
 #include "device_status.h"
 #include "storage.h"
 #include "runtime.h"
+#include "power_policy.h"
+#include "factory_reset.h"
+#include "ble_lifecycle_policy.h"
 
 static const char *TAG = "app";
 
@@ -167,7 +170,8 @@ static void slot_status_task(void *arg)
                 device_slots[i].valid = true;
             } else device_slots[i].valid = false;
         }
-        vTaskDelay(pdMS_TO_TICKS(15000));
+        /* Keep dashboard status useful without polling both modems too often. */
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
@@ -237,7 +241,9 @@ static void modems_boot_task(void *arg)
     }
     ESP_LOGI(TAG, "modems ready");
     if (!s_safe_mode) xTaskCreate(boot_ok_task, "boot_ok", 2048, NULL, 3, NULL);
-    vTaskDelete(NULL);
+    /* The receive loop inherits this stack. Wi-Fi, TLS and BLE can all be
+     * starting here; allocating a second 24 KiB stack can starve SMS/calls. */
+    sms_run();
 }
 
 static void net_task(void *arg)
@@ -292,6 +298,12 @@ static void net_task(void *arg)
             esp_err_t e = feishu_ws_start();
             fs_retry_at = now + (e == ESP_OK ? 5000 : 8000);
         }
+        bool setup_done = cfg_setup_done();
+        if (ble_lifecycle_can_complete(setup_done, has_ip, feishu_ws_connected()) &&
+            rpc_complete_setup()) {
+            ESP_LOGI(TAG, "Wi-Fi and authenticated Feishu websocket are online; closing BLE setup");
+            ble_lockdown();
+        }
         if (online && !was_online) sms_retry_pending();
         was_online = online;
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000))) {
@@ -315,6 +327,14 @@ static void on_peer_learned(const char *open_id, const char *chat_id)
 
 void app_main(void)
 {
+    esp_err_t pm_err = power_policy_init();
+    if (pm_err != ESP_OK) {
+        ESP_LOGW(TAG, "power policy unavailable (%s)", esp_err_to_name(pm_err));
+    }
+    char power_status[48];
+    power_policy_status(power_status, sizeof(power_status));
+    ESP_LOGI(TAG, "clock %s", power_status);
+
     esp_reset_reason_t reset_reason = esp_reset_reason();
     if (s_boot_magic != BOOT_MAGIC) {
         s_boot_magic = BOOT_MAGIC;
@@ -327,12 +347,22 @@ void app_main(void)
 
     leds_init();
 
-    esp_err_t nerr = nvs_flash_init();
-    if (nerr == ESP_OK) cfg_init();
-    else {
-        ESP_LOGE(TAG, "NVS init failed: %s; stored configuration preserved", esp_err_to_name(nerr));
-        cfg_defaults();
-        cfg_apply_timezone();
+    esp_err_t nerr;
+    while ((nerr = nvs_flash_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s; startup is held for safe recovery",
+                 esp_err_to_name(nerr));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    esp_err_t reset_err;
+    while ((reset_err = factory_reset_recover()) != ESP_OK) {
+        ESP_LOGE(TAG, "factory-reset recovery failed: %s; startup is held",
+                 esp_err_to_name(reset_err));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    esp_err_t cfg_err = cfg_init();
+    if (cfg_err != ESP_OK) {
+        ESP_LOGE(TAG, "configuration load failed: %s; startup is held", esp_err_to_name(cfg_err));
+        for (;;) vTaskDelay(pdMS_TO_TICKS(5000));
     }
     esp_err_t storage_err = storage_mount();
     if (storage_err != ESP_OK) ESP_LOGE(TAG, "storage unavailable: %s", esp_err_to_name(storage_err));
@@ -392,7 +422,7 @@ void app_main(void)
         feishu_set_cmd_cb(cmd_handle);
         feishu_set_peer_cb(on_peer_learned);
         wifi_preinit(); /* Initialize the driver only; net_task owns the first start. */
-        xTaskCreate(modems_boot_task, "modem_boot", 24576, NULL, 6, NULL);
+        xTaskCreate(modems_boot_task, "modem_sms", 24576, NULL, 6, NULL);
         xTaskCreate(slot_status_task, "slot_status", 4096, NULL, 3, NULL);
         xTaskCreate(net_task, "net", 6144, NULL, 4, &s_net_task);
         health_start(s_modems);

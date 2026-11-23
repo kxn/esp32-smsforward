@@ -8,6 +8,8 @@
 enum { SMS_SEND_ERR_MODEM=-4, SMS_SEND_ERR_PARTIAL=-5 };
 
 esp_err_t sms_init(modem_t *modems);
+/* Own the receive queue on the existing modem bootstrap stack after initialization. */
+void sms_run(void);
 /* Reapply per-modem SMS storage, PDU mode, inbound URCs, and call reporting. */
 esp_err_t sms_modem_configure(int slot);
 bool sms_modem_is_configured(int slot);
@@ -19,4 +21,3 @@ int sms_read_index(modem_t *m, int idx);
 void sms_urc(modem_t *m, const char *line);
 /* 重试转发此前保留的短信（网络恢复后调用） */
 void sms_retry_pending(void);
-bool sms_clear_persistent_dedup(void);

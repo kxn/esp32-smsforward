@@ -13,6 +13,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_crt_bundle.h"
@@ -53,6 +54,7 @@ static int64_t s_ws_created_ms;
 static int64_t s_ws_retry_at_ms;
 static volatile uint32_t s_ws_epoch;
 static volatile uint32_t s_ws_cfg_generation;
+static volatile uint32_t s_ws_online_epoch;
 
 static void ws_epoch_advance(void)
 {
@@ -70,7 +72,7 @@ static QueueHandle_t s_tx_q;
 static TaskHandle_t s_event_task, s_tx_task;
 static feishu_ws_assembler_t s_ws_assembler;
 static feishu_pbbp_assembler_t s_pbbp_assembler;
-static feishu_event_dedup_t s_event_dedup;
+static EXT_RAM_BSS_ATTR feishu_event_dedup_t s_event_dedup;
 
 static void learn_peer_for_generation(const char *open_id, const char *chat_id,
                                      uint32_t generation);
@@ -770,6 +772,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     esp_websocket_event_data_t *d = (esp_websocket_event_data_t *)data;
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
+        s_ws_online_epoch = handler_epoch;
         s_ws_connected = true;
         ESP_LOGI(TAG, "ws connected");
         break;
@@ -919,10 +922,13 @@ esp_err_t feishu_ws_start(void)
     }
 
     cJSON *j = cJSON_Parse(resp);
+    cJSON *code = j ? cJSON_GetObjectItem(j, "code") : NULL;
     cJSON *data = j ? cJSON_GetObjectItem(j, "data") : NULL;
     cJSON *url = data ? cJSON_GetObjectItem(data, "URL") : NULL;
     cJSON *cc = data ? cJSON_GetObjectItem(data, "ClientConfig") : NULL;
-    if (!url || !cJSON_IsString(url)) {
+    if (status != 200 || !cJSON_IsNumber(code) || code->valuedouble != 0 ||
+        !cJSON_IsString(url) || strncmp(url->valuestring, "wss://", 6) != 0 ||
+        strlen(url->valuestring) >= sizeof(s_ws_url)) {
         ESP_LOGE(TAG, "ws endpoint response invalid (http=%d)", status);
         if (j) cJSON_Delete(j);
         free(resp);
@@ -1022,6 +1028,18 @@ void feishu_ws_stop(void)
 
 bool feishu_ws_connected(void) { return s_ws_connected; }
 int feishu_ws_reconnects(void) { return s_ws_reconnects; }
+
+bool feishu_ws_authenticated_for(const char *app_id, const char *app_secret)
+{
+    if (!s_ws_lifecycle_lock || !app_id || !*app_id || !app_secret || !*app_secret ||
+        xSemaphoreTake(s_ws_lifecycle_lock, 0) != pdTRUE) return false;
+    bool online = s_ws_connected && s_ws_online_epoch == s_ws_epoch &&
+                  s_ws_cfg_generation == s_cfg_generation &&
+                  strcmp(s_cfg.app_id, app_id) == 0 && strcmp(s_cfg.app_secret, app_secret) == 0 &&
+                  s_ws && esp_websocket_client_is_connected(s_ws);
+    xSemaphoreGive(s_ws_lifecycle_lock);
+    return online;
+}
 
 static void learn_peer_for_generation(const char *open_id, const char *chat_id, uint32_t generation)
 {

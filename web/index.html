@@ -418,6 +418,43 @@
         font-size: 12px;
         overflow-wrap: anywhere;
       }
+      .monitor-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+      .monitor-grid .network-value {
+        font-variant-numeric: tabular-nums;
+      }
+      .monitor-status {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .provision-guide {
+        margin-bottom: 18px;
+        padding: 12px 15px;
+        border: 1px solid #d7dfd5;
+        border-radius: 12px;
+        background: #f2f5ee;
+      }
+      .provision-guide p {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .factory-dialog {
+        width: min(460px, calc(100% - 32px));
+        padding: 22px;
+        border: 1px solid #d7dfd5;
+        border-radius: 14px;
+        color: var(--ink);
+        background: #fffefa;
+      }
+      .factory-dialog::backdrop {
+        background: #172b22a8;
+      }
+      .factory-dialog p {
+        margin: 10px 0 18px;
+      }
       .state-good {
         color: var(--pine-dark);
       }
@@ -604,6 +641,9 @@
         border-color: #176453;
       }
       @media (max-width: 760px) {
+        .monitor-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
         .top-inner {
           padding: 0 16px;
         }
@@ -772,6 +812,10 @@
         <button type="button" data-view="slots">卡槽</button>
         <button type="button" data-view="system">系统</button>
       </nav>
+      <aside class="provision-guide" id="provisionGuide" aria-labelledby="provisionTitle">
+        <strong id="provisionTitle">蓝牙配置</strong>
+        <p id="provisionText"></p>
+      </aside>
 
       <section
         class="view"
@@ -792,6 +836,32 @@
         <section class="network-section" aria-labelledby="network-heading">
           <h2 class="section-title" id="network-heading">连接状态</h2>
           <div class="network-grid" id="networkGrid"></div>
+        </section>
+        <section class="network-section" aria-labelledby="monitor-heading">
+          <h2 class="section-title" id="monitor-heading">运行监控</h2>
+          <p class="monitor-status" id="monitorStatus">设备未连接</p>
+          <div class="network-grid monitor-grid">
+            <article class="network-card">
+              <div class="network-label">CPU 占用</div>
+              <div class="network-value" id="cpuValue">—</div>
+              <div class="network-detail" id="cpuDetail">—</div>
+            </article>
+            <article class="network-card">
+              <div class="network-label">芯片温度</div>
+              <div class="network-value" id="temperatureValue">—</div>
+              <div class="network-detail" id="temperatureDetail">—</div>
+            </article>
+            <article class="network-card">
+              <div class="network-label">可用内存</div>
+              <div class="network-value" id="heapValue">—</div>
+              <div class="network-detail" id="heapDetail">—</div>
+            </article>
+            <article class="network-card">
+              <div class="network-label">运行时间</div>
+              <div class="network-value" id="uptimeValue">—</div>
+              <div class="network-detail">自设备启动</div>
+            </article>
+          </div>
         </section>
       </section>
 
@@ -1067,13 +1137,23 @@
               id="btnFactory"
               data-device-action
               type="button"
+              hidden
             >
               恢复出厂设置
             </button>
           </div>
+          <p class="view-sub" id="factoryLanOnly">在飞书私聊发送 /web，打开局域网管理页后可恢复出厂设置。</p>
         </section>
       </section>
     </main>
+    <dialog class="factory-dialog" id="factoryDialog" aria-labelledby="factoryTitle" aria-describedby="factoryDescription">
+      <h2 class="section-title" id="factoryTitle">恢复出厂设置？</h2>
+      <p id="factoryDescription">设备将清除 Wi-Fi、飞书凭证和绑定、卡槽设置、引用映射及去重记录，然后重启并重新开放蓝牙配置。当前固件和 SIM 卡内的短信会保留。</p>
+      <form class="actions" id="factoryForm" method="dialog">
+        <button class="button" type="submit" value="cancel" autofocus>取消</button>
+        <button class="button button-danger" type="submit" value="confirm">确认恢复出厂</button>
+      </form>
+    </dialog>
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       "use strict";
@@ -1081,6 +1161,7 @@
         CMD = "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
         RSP = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
       const enc = new TextEncoder();
+      const TELEMETRY_INTERVAL_MS = 5000;
       const S = {
         device: null,
         cmd: null,
@@ -1092,10 +1173,17 @@
         buf: "",
         decoder: new TextDecoder(),
         statusTimer: null,
+        statusRefresh: null,
+        statusVersion: 0,
+        telemetryTimer: null,
+        telemetryPoll: null,
+        telemetrySupported: true,
+        telemetryLastRead: "",
         writeChain: Promise.resolve(),
         view: "overview",
         transport: "ble",
         lanToken: "",
+        factoryPending: false,
       };
       const $ = (id) => document.getElementById(id);
       const drafts = new Map();
@@ -1138,11 +1226,20 @@
         $("btnConnect").hidden = S.transport === "lan";
         for (const b of document.querySelectorAll("[data-device-action]"))
           b.disabled = !on;
+        updateFactoryControl();
+        renderProvisionGuide();
         if (on) {
           startStatusTimer();
           $("overviewSub").textContent = "正在读取状态";
+          $("monitorStatus").textContent = "正在读取监控数据…";
+          syncTelemetryPolling();
         } else {
           stopStatusTimer();
+          S.statusVersion++;
+          stopTelemetryPolling();
+          S.telemetrySupported = true;
+          S.telemetryLastRead = "";
+          renderTelemetry({}, "设备未连接");
           drafts.clear();
           $("pass").value = "";
           $("appsecret").value = "";
@@ -1171,6 +1268,7 @@
         document
           .querySelectorAll(".view")
           .forEach((v) => (v.hidden = v.id !== "view-" + name));
+        syncTelemetryPolling();
         document
           .querySelector("main")
           .scrollIntoView({ block: "start", behavior: "smooth" });
@@ -1278,24 +1376,23 @@
           if (p) {
             clearTimeout(p.timer);
             S.pending.delete(msg.id);
-            if (p.cmd === "status" && msg.ok) renderStatus(msg);
             p.resolve(msg);
           }
         }
       }
-      function rpc(obj, timeout = 8000) {
-        if (S.transport === "lan") return lanRpc(obj, timeout);
+      function rpc(obj, timeout = 8000, signal) {
+        if (S.transport === "lan") return lanRpc(obj, timeout, signal);
         return new Promise((resolve, reject) => {
-          if (!S.connected || !S.cmd) {
+          if (!S.connected || !S.cmd || signal?.aborted) {
             reject(new Error("未连接"));
             return;
           }
+          const characteristic = S.cmd;
           const id = S.seq++;
           const payload = { ...obj, id };
           S.pending.set(id, {
             resolve,
             reject,
-            cmd: obj.cmd,
             timer: setTimeout(() => {
               if (S.pending.has(id)) {
                 S.pending.delete(id);
@@ -1306,8 +1403,10 @@
           const bytes = enc.encode(JSON.stringify(payload) + "\n");
           S.writeChain = S.writeChain
             .then(async () => {
+              if (!S.pending.has(id)) return;
+              if (signal?.aborted) throw new Error("请求已取消");
               for (let i = 0; i < bytes.length; i += 20)
-                await S.cmd.writeValueWithResponse(bytes.slice(i, i + 20));
+                await characteristic.writeValueWithResponse(bytes.slice(i, i + 20));
             })
             .catch((e) => {
               const p = S.pending.get(id);
@@ -1322,6 +1421,8 @@
       const lanStorageKey = () => "smsf-lan-token:" + location.origin;
       function setLanGate(message) {
         stopStatusTimer();
+        stopTelemetryPolling();
+        S.statusVersion++;
         S.connected = false;
         S.lanToken = "";
         $("btnConnect").hidden = true;
@@ -1332,6 +1433,8 @@
         $("lanGateMessage").textContent = message;
         $("lanGate").hidden = false;
         for (const b of document.querySelectorAll("[data-device-action]")) b.disabled = true;
+        updateFactoryControl();
+        renderProvisionGuide();
       }
       function clearLanToken() {
         S.lanToken = "";
@@ -1341,39 +1444,42 @@
         clearLanToken();
         setLanGate(message);
       }
-      async function lanRpc(obj, timeout = 8000) {
-        if (!S.lanToken) throw new Error("请在飞书发送 /web 获取管理链接");
+      async function lanRpc(obj, timeout = 8000, signal) {
+        const token = S.lanToken;
+        if (!token) throw new Error("请在飞书发送 /web 获取管理链接");
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeout);
+        const abort = () => controller.abort();
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+        const timer = setTimeout(abort, timeout);
         let response;
+        let result;
         try {
-          response = await fetch("/api/rpc", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: "Bearer " + S.lanToken,
-            },
-            cache: "no-store",
-            credentials: "same-origin",
-            referrerPolicy: "no-referrer",
-            signal: controller.signal,
-            body: JSON.stringify({ ...obj, id: S.seq++ }),
-          });
-        } catch (error) {
-          throw new Error(error?.name === "AbortError" ? "设备响应超时" : "设备暂不可达，请检查 Wi-Fi 或重新获取 /web 链接");
+          try {
+            response = await fetch("/api/rpc", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer " + token,
+              },
+              cache: "no-store",
+              credentials: "same-origin",
+              referrerPolicy: "no-referrer",
+              signal: controller.signal,
+              body: JSON.stringify({ ...obj, id: S.seq++ }),
+            });
+          } catch (error) {
+            throw new Error(error?.name === "AbortError" ? "设备响应超时" : "设备暂不可达，请检查 Wi-Fi 或重新获取 /web 链接");
+          }
+          if (response.status === 401 || response.status === 403) {
+            if (S.lanToken === token) lockLan("管理授权已失效，请在飞书私聊发送 /web 获取新链接");
+            throw new Error("管理授权已失效");
+          }
+          if (!response.ok) throw new Error("设备请求失败（HTTP " + response.status + "）");
+          try { result = await response.json(); } catch { throw new Error("设备响应格式异常"); }
         } finally {
           clearTimeout(timer);
-        }
-        if (response.status === 401 || response.status === 403) {
-          lockLan("管理授权已失效，请在飞书私聊发送 /web 获取新链接");
-          throw new Error("管理授权已失效");
-        }
-        if (!response.ok) throw new Error("设备请求失败（HTTP " + response.status + "）");
-        let result;
-        try { result = await response.json(); } catch { throw new Error("设备响应格式异常"); }
-        if (obj.cmd === "status" && result.ok) {
-          renderStatus(result);
-          $("connText").textContent = "局域网已连接";
+          signal?.removeEventListener("abort", abort);
         }
         return result;
       }
@@ -1410,11 +1516,11 @@
           lockLan("请在飞书私聊发送 /web，打开回复中的链接进入设备管理");
           return;
         }
+        setLanGate("正在验证管理链接…");
         S.lanToken = token;
-        $("lanGate").hidden = false;
-        $("lanGateMessage").textContent = "正在验证管理链接…";
         try {
           const status = await lanRpc({ cmd: "status" });
+          if (S.lanToken !== token) return;
           if (!status.ok) {
             lockLan("管理链接无效，请在飞书私聊发送 /web 获取新链接");
             return;
@@ -1426,29 +1532,148 @@
           $("connText").textContent = "局域网已连接";
           $("devName").textContent = status.data?.device_name || "设备局域网管理";
         } catch (error) {
-          if (S.lanToken) {
+          if (S.lanToken === token) {
             $("lanGate").hidden = false;
             $("lanGateMessage").textContent = error.message || "设备暂不可达，请检查 Wi-Fi 后重试";
           }
         }
       }
+      window.addEventListener("hashchange", () => {
+        if (S.transport === "lan" && new URLSearchParams(location.hash.slice(1)).has("token")) {
+          detectLanTransport();
+        }
+      });
       function startStatusTimer() {
         stopStatusTimer();
         S.statusTimer = setInterval(() => {
-          if (!S.pending.size) refresh();
+          if (!document.hidden && !S.pending.size && !S.telemetryPoll) refresh();
         }, 9000);
       }
       function stopStatusTimer() {
         if (S.statusTimer) clearInterval(S.statusTimer);
         S.statusTimer = null;
       }
-      function refresh() {
-        rpc({ cmd: "status" }).catch((error) => {
-          if (S.transport === "lan" && S.lanToken) {
-            $("connText").textContent = "局域网暂不可达";
-            $("overviewSub").textContent = "设备暂时无法访问；检查 Wi-Fi 后会自动重试，或在飞书发送 /web 获取新地址";
+      function refresh(afterSave = false) {
+        if (afterSave) S.statusVersion++;
+        if (S.statusRefresh) return afterSave ? S.statusRefresh.then(() => refresh()) : S.statusRefresh;
+        const version = S.statusVersion;
+        S.statusRefresh = rpc({ cmd: "status" })
+          .then((reply) => {
+            if (S.connected && version === S.statusVersion && reply.ok) {
+              renderStatus(reply);
+              if (S.transport === "lan") $("connText").textContent = "局域网已连接";
+            }
+          })
+          .catch(() => {
+            if (S.transport === "lan" && S.lanToken && version === S.statusVersion) {
+              $("connText").textContent = "局域网暂不可达";
+              $("overviewSub").textContent = "设备暂时无法访问；检查 Wi-Fi 后会自动重试，或在飞书发送 /web 获取新地址";
+            }
+          })
+          .finally(() => {
+            S.statusRefresh = null;
+          });
+        return S.statusRefresh;
+      }
+      function telemetryActive() {
+        return S.connected && S.view === "overview" && !document.hidden && S.telemetrySupported;
+      }
+      function scheduleTelemetry(delay) {
+        S.telemetryTimer = setTimeout(pollTelemetry, delay);
+      }
+      function stopTelemetryPolling() {
+        clearTimeout(S.telemetryTimer);
+        S.telemetryTimer = null;
+        S.telemetryPoll?.abort();
+      }
+      function syncTelemetryPolling() {
+        if (!telemetryActive()) {
+          stopTelemetryPolling();
+        } else if (S.telemetryTimer === null && !S.telemetryPoll) {
+          scheduleTelemetry(0);
+        }
+      }
+      async function pollTelemetry() {
+        S.telemetryTimer = null;
+        if (!telemetryActive() || S.telemetryPoll) return;
+        const controller = new AbortController();
+        S.telemetryPoll = controller;
+        let started = performance.now();
+        try {
+          if (S.statusRefresh) await S.statusRefresh;
+          if (controller.signal.aborted) return;
+          started = performance.now();
+          const reply = await rpc({ cmd: "telemetry" }, 8000, controller.signal);
+          if (controller.signal.aborted) return;
+          if (!reply.ok && reply.err === "unknown") {
+            S.telemetrySupported = false;
+            renderTelemetry({}, "当前固件不提供运行监控");
+          } else if (reply.ok && reply.data) {
+            S.telemetryLastRead = new Date().toLocaleTimeString();
+            renderTelemetry(reply.data, `最近读取 ${S.telemetryLastRead} · 每 5 秒刷新`);
+          } else {
+            showTelemetryError();
           }
-        });
+        } catch {
+          if (!controller.signal.aborted) showTelemetryError();
+        } finally {
+          S.telemetryPoll = null;
+          if (telemetryActive()) {
+            const delay = controller.signal.aborted ? 0 : Math.max(500, TELEMETRY_INTERVAL_MS - (performance.now() - started));
+            scheduleTelemetry(delay);
+          }
+        }
+      }
+      document.addEventListener("visibilitychange", syncTelemetryPolling);
+      window.addEventListener("pagehide", stopTelemetryPolling);
+      window.addEventListener("pageshow", syncTelemetryPolling);
+      function showTelemetryError() {
+        $("monitorStatus").textContent = S.telemetryLastRead
+          ? `读取失败，等待重试 · 上次成功 ${S.telemetryLastRead}` : "监控数据暂不可用，等待重试";
+      }
+      function renderTelemetry(data, status) {
+        const { cpu, temperature_c, temperature_state, heap_free_bytes, heap_total_bytes,
+          psram_free_bytes, psram_total_bytes, uptime_s } = data;
+        const mib = (bytes) => (bytes / (1024 * 1024)).toFixed(1) + " MiB";
+        const percent = (value) => Number.isFinite(value) ? value.toFixed(1) + "%" : "—";
+        const windowLabel = Number.isFinite(cpu?.window_ms)
+          ? `${Number((cpu.window_ms / 1000).toFixed(1))} 秒采样窗口` : "";
+        const coreLabels = Array.isArray(cpu?.core_pct)
+          ? cpu.core_pct.map((value, core) => `核 ${core} ${percent(value)}`) : [];
+        const cpuDetail = cpu?.state === "warming_up" ? "等待首个完整采样窗口" : cpu?.state === "ok"
+          ? [windowLabel, ...coreLabels].filter(Boolean).join(" · ")
+          : cpu ? "采样不可用" : "—";
+        const temperatureDetail = temperature_state === "ok" ? "芯片内部传感器" : temperature_state === "unsupported"
+          ? "该设备未提供传感器" : temperature_state === "out_of_range" ? "超出传感器量程" : temperature_state ? "传感器暂不可用" : "—";
+        const uptime = Number.isFinite(uptime_s) ? formatUptime(uptime_s) : "—";
+        const internal = Number.isFinite(heap_free_bytes) ? `${Math.round(heap_free_bytes / 1024)} KiB` : "—";
+        const internalTotal = Number.isFinite(heap_total_bytes) ? ` / ${Math.round(heap_total_bytes / 1024)} KiB` : "";
+        const psram = Number.isFinite(psram_free_bytes) && psram_total_bytes > 0
+          ? `PSRAM ${mib(psram_free_bytes)} / ${mib(psram_total_bytes)}` : "";
+        const values = {
+          monitorStatus: status,
+          cpuValue: percent(cpu?.used_pct),
+          cpuDetail,
+          temperatureValue: Number.isFinite(temperature_c) ? `${temperature_c.toFixed(1)} °C` : "—",
+          temperatureDetail,
+          heapValue: internal + internalTotal,
+          heapDetail: psram ? `内部内存 · ${psram}` : "内部内存",
+          uptimeValue: uptime,
+        };
+        for (const [id, value] of Object.entries(values)) {
+          const element = $(id);
+          if (element.textContent !== value) element.textContent = value;
+        }
+      }
+      function formatUptime(seconds) {
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor(seconds / 3600) % 24;
+        const minutes = Math.floor(seconds / 60) % 60;
+        const remainder = Math.floor(seconds) % 60;
+        if (days > 0) return `${days} 天 ${hours} 小时`;
+        if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+        if (minutes > 0) return `${minutes} 分 ${remainder} 秒`;
+        return `${remainder} 秒`;
       }
       function esc(x) {
         return String(x ?? "").replace(
@@ -1496,12 +1721,40 @@
           )
           .join("");
       }
+      function renderProvisionGuide(data = {}) {
+        const guide = $("provisionGuide");
+        guide.hidden = S.transport !== "ble";
+        if (guide.hidden) return;
+        let title = "蓝牙配置";
+        let text = "首次使用请选择设备。若设备已连上 Wi-Fi 和飞书，发布应用后在机器人私聊发送 /help，再发 /web。需要恢复蓝牙时，短按 BOOT 后在 120 秒内重连。";
+        if (S.connected && data.setup_done) {
+          title = "蓝牙恢复配置";
+          text = "短按 BOOT 后，蓝牙可用 120 秒。保存需要修正的设置，再回飞书私聊发送 /web 打开局域网管理。";
+        } else if (S.connected && data.wifi && data.feishu) {
+          if (!data.wifi.ip) {
+            title = "连接 Wi-Fi";
+            text = "在「网络」填写 Wi-Fi 名称和密码，短按设备 BOOT 后保存。";
+          } else if (!data.feishu.configured) {
+            title = "配置飞书";
+            text = "在「飞书」填写同一应用的 App ID 和 App Secret，短按 BOOT 后保存。";
+          } else if (data.feishu.state !== "online") {
+            title = "等待飞书上线";
+            text = "Wi-Fi 和飞书都连通后，设备会自动关闭蓝牙。完成飞书应用发布后，在机器人私聊发送 /help，再发 /web。";
+          } else {
+            title = "接下来使用局域网管理";
+            text = "蓝牙将自动关闭。发布飞书应用后，在机器人私聊发送 /help 完成绑定，再发送 /web 打开链接。";
+          }
+        }
+        if ($("provisionTitle").textContent !== title) $("provisionTitle").textContent = title;
+        if ($("provisionText").textContent !== text) $("provisionText").textContent = text;
+      }
       function renderStatus(msg) {
         const d = msg.data || {},
           slots = d.slots || [],
           wifi = d.wifi || {},
           fs = d.feishu || {},
           time = d.time || {};
+        renderProvisionGuide(d);
         renderSlot(0, slots[0]);
         renderSlot(1, slots[1]);
         $("overviewSub").textContent =
@@ -1661,7 +1914,7 @@
             }
             if (saved("wifi", version)) $("pass").value = "";
             toast("网络配置已保存，正在连接", "ok");
-            refresh();
+            refresh(true);
           } catch (e) {
             errToast(e);
           }
@@ -1681,7 +1934,7 @@
             }
             if (saved("feishu", version)) $("appsecret").value = "";
             toast("飞书配置已保存", "ok");
-            refresh();
+            refresh(true);
           } catch (e) {
             errToast(e);
           }
@@ -1704,7 +1957,7 @@
             }
             saved("slots", version);
             toast("卡槽配置已保存", "ok");
-            refresh();
+            refresh(true);
           } catch (e) {
             errToast(e);
           }
@@ -1727,7 +1980,7 @@
             }
             saved("time", version);
             toast("时区已保存", "ok");
-            refresh();
+            refresh(true);
           } catch (e) {
             errToast(e);
           }
@@ -1749,22 +2002,42 @@
           setTimeout(() => setConn(false), 900);
         }),
       );
-      $("btnFactory").addEventListener("click", async () => {
-        if (
-          !S.connected ||
-          !confirm("清除配置、回复映射与去重记录；保留 SIM 内短信。继续？")
-        )
-          return;
+      function canResetFactory() {
+        return S.connected && S.transport === "lan" && Boolean(S.lanToken);
+      }
+      function updateFactoryControl() {
+        const allowed = canResetFactory();
+        $("btnFactory").hidden = !allowed;
+        $("btnFactory").disabled = !allowed || S.factoryPending;
+        $("factoryLanOnly").hidden = S.transport === "lan";
+        if (!allowed && $("factoryDialog").open) $("factoryDialog").close();
+      }
+      $("btnFactory").addEventListener("click", () => {
+        if (canResetFactory() && !S.factoryPending && !$("factoryDialog").open) {
+          $("factoryDialog").showModal();
+        }
+      });
+      $("factoryForm").addEventListener("submit", async (event) => {
+        if (event.submitter?.value !== "confirm") return;
+        event.preventDefault();
+        if (!canResetFactory() || S.factoryPending || !$("factoryDialog").open) return;
+        S.factoryPending = true;
+        updateFactoryControl();
+        $("factoryDialog").close();
         try {
-          const r = await rpc({ cmd: "factory_reset" }, 2500);
+          const r = await rpc({ cmd: "factory_reset", confirm: true });
           if (!r.ok) {
             toast(deviceError(r.err), "bad");
             return;
           }
-          toast("正在恢复出厂设置", "ok");
-          setTimeout(() => setConn(false), 900);
+          clearLanToken();
+          setConn(false);
+          setLanGate("设备正在重启。请打开蓝牙配置页重新配网。");
         } catch (e) {
           toast(deviceError(e.message), "bad");
+        } finally {
+          S.factoryPending = false;
+          updateFactoryControl();
         }
       });
       document

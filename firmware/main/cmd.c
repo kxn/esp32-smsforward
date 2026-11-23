@@ -565,14 +565,6 @@ void cmd_init(void *modems)
     if (!map_store_init("/data/map.dat")) ESP_LOGE(TAG,"map store init failed");
 }
 
-bool cmd_clear_persistent_map(void)
-{
-    if (s_map_lock) xSemaphoreTake(s_map_lock, portMAX_DELAY);
-    bool ok = map_store_clear();
-    if (s_map_lock) xSemaphoreGive(s_map_lock);
-    return ok;
-}
-
 void cmd_set_slot(int slot, const char *name, const char *number)
 {
     if (slot < 0 || slot > 1) return;

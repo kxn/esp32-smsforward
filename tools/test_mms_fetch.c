@@ -27,6 +27,8 @@ static int g_mipcfg_restore;
 static bool g_socket_busy, g_cid5_busy, g_cid5_explicit_inactive;
 static bool g_inject_roam, g_inject_drop, g_inject_bad_cereg;
 static bool g_roam_on_activation, g_cereg_override, g_cereg_unknown, g_cops_foreign, g_imsi_foreign;
+static uart_config_t g_last_uart_config;
+static bool g_uart_config_seen;
 
 void fake_critical_enter(portMUX_TYPE *mux) { (void)mux; }
 void fake_critical_exit(portMUX_TYPE *mux) { (void)mux; }
@@ -194,7 +196,8 @@ int uart_read_bytes(uart_port_t uart, void *buf, uint32_t len, uint32_t ticks)
 { (void)uart; (void)buf; (void)len; (void)ticks; return 0; }
 int uart_driver_install(uart_port_t uart, int rx, int tx, int events, void *queue, int flags)
 { (void)uart; (void)rx; (void)tx; (void)events; (void)queue; (void)flags; return 0; }
-int uart_param_config(uart_port_t uart, const uart_config_t *cfg) { (void)uart; (void)cfg; return 0; }
+int uart_param_config(uart_port_t uart, const uart_config_t *cfg)
+{ (void)uart; g_last_uart_config = *cfg; g_uart_config_seen = true; return 0; }
 int uart_set_pin(uart_port_t uart, int tx, int rx, int rts, int cts)
 { (void)uart; (void)tx; (void)rx; (void)rts; (void)cts; return 0; }
 int uart_flush_input(uart_port_t uart) { (void)uart; return 0; }
@@ -237,6 +240,11 @@ static void prepare_http(void)
 
 int main(void)
 {
+    modem_t uart_modem = {0};
+    g_uart_config_seen = false;
+    assert(modem_init(&uart_modem, 0) == ESP_OK);
+    assert(g_uart_config_seen && g_last_uart_config.source_clk == UART_SCLK_XTAL);
+
     prepare_http();
     reset_fake();
     g_cid5_explicit_inactive = true;
