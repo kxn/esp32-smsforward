@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import json
+import socket
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import gettempdir
@@ -46,6 +47,7 @@ BLE_STUB = r"""
       if (state.failNext) { const err = state.failNext; state.failNext = null; reply = { id: req.id, ok: false, err }; }
       else if (req.cmd === 'status') reply = { id: req.id, ok: true, data: {
         slots: state.slots, wifi: state.wifi, feishu: state.fs,
+        firmware: { version: '1.2.3', board: 'test-board', can_upload: true },
         time: { synced: true, utc: 1763900000, tz: state.tz }
       }};
       else if (req.cmd === 'telemetry') {
@@ -123,7 +125,7 @@ class LanHandler(Handler):
         super().do_GET()
 
     def do_POST(self):
-        if self.path != "/api/rpc":
+        if self.path not in ("/api/rpc", "/api/firmware"):
             self._json(404, {"ok": False, "err": "not_found"})
             return
         if not self.server.available:
@@ -135,7 +137,21 @@ class LanHandler(Handler):
             self._json(401, {"ok": False, "err": "unauthorized"})
             return
         length = int(self.headers.get("Content-Length", "0"))
-        request = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length)
+        if self.path == "/api/firmware":
+            self.server.firmware_requests.append((auth, self.headers.get("Content-Type"), raw))
+            if not self.server.firmware_release.wait(10):
+                self._json(500, {"ok": False, "err": "test_timeout"})
+            elif self.server.firmware_behavior == "drop":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.close_connection = True
+            elif self.server.firmware_behavior == "mismatch":
+                self._json(400, {"ok": False, "err": "wrong_board"})
+            else:
+                self.server.firmware_status["version"] = "1.2.4"
+                self._json(200, {"ok": True, "version": "1.2.4"})
+            return
+        request = json.loads(raw or b"{}")
         if request.get("cmd") == "telemetry":
             self.server.telemetry_count += 1
             self._json(200, {"id": request.get("id"), "ok": True, "data": {
@@ -155,6 +171,7 @@ class LanHandler(Handler):
         if request.get("cmd") != "status":
             self._json(200, {"id": request.get("id"), "ok": True})
             return
+        self.server.status_count += 1
         self._json(200, {"id": request.get("id"), "ok": True, "data": {
             "slots": [
                 {"n": 1, "name": "LAN 主卡", "num": "13800138000", "reg": True, "op": "运营商", "csq": 20},
@@ -163,6 +180,7 @@ class LanHandler(Handler):
             "wifi": {"ssid": "Studio", "cfg_ssid": "Studio", "ip": "192.168.1.40", "cfg_ip": "192.168.1.40", "dhcp": True},
             "feishu": {"state": "online", "configured": True, "app_id": "cli_test"},
             "time": {"synced": True, "utc": 1763900000, "tz": 8},
+            **({"firmware": self.server.firmware_status} if self.server.firmware_status is not None else {}),
         }})
 
     def _json(self, status, body):
@@ -181,6 +199,12 @@ def start_lan_server(token):
     server.auth_headers = []
     server.telemetry_count = 0
     server.factory_requests = []
+    server.firmware_requests = []
+    server.firmware_release = threading.Event()
+    server.firmware_release.set()
+    server.firmware_behavior = "mismatch"
+    server.firmware_status = None
+    server.status_count = 0
     server.available = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -279,13 +303,101 @@ def test_lan_mode(browser) -> None:
         first.expected_token = token
         page.goto(first_url)
         page.locator("#view-overview").wait_for(state="visible")
+        test_firmware_upload(page, first, first_url, token)
         test_factory_reset(page, first)
-        print("PASS LAN detection, fragment cleanup, Bearer RPC, telemetry cancellation, token isolation, and factory reset confirmation")
+        print("PASS LAN detection, fragment cleanup, Bearer RPC, telemetry cancellation, token isolation, firmware upload, and factory reset confirmation")
     finally:
         page.close()
         for server in (first, second, ble):
             server.shutdown()
             server.server_close()
+
+
+def test_firmware_upload(page, server, url, token) -> None:
+    system = page.get_by_role("button", name="系统", exact=True)
+    panel = page.locator("#firmwarePanel")
+    picker = page.locator("#firmwareFile")
+    result = page.locator("#firmwareResult")
+    upload = page.get_by_role("button", name="上传并更新")
+    dialog = page.get_by_role("dialog", name="更新固件？")
+    confirm = dialog.get_by_role("button", name="确认上传")
+    payload = b"SMSFW\x00\xff\x01\x02"
+    package = {"name": "update.smsfw", "mimeType": "application/octet-stream", "buffer": payload}
+    system.click()
+    assert panel.is_hidden()
+    server.firmware_status = {"version": "1.2.3", "board": "test-board", "can_upload": False}
+    page.evaluate("refresh()")
+    assert panel.is_visible()
+    assert "1.2.3" in page.locator("#firmwareVersion").inner_text()
+    assert picker.is_hidden()
+    server.firmware_status["can_upload"] = True
+    page.evaluate("refresh()")
+    picker.wait_for()
+    picker.set_input_files({**package, "name": "wrong.bin"})
+    assert "有效的 .smsfw" in result.inner_text()
+    assert upload.is_disabled()
+    picker.set_input_files(package)
+    upload.click()
+    assert "1.2.3" in dialog.inner_text()
+    assert "update.smsfw" in dialog.inner_text()
+    page.keyboard.press("Enter")
+    assert dialog.is_hidden()
+    assert not server.firmware_requests
+
+    server.firmware_release.clear()
+    upload.click()
+    confirm.click()
+    try:
+        page.locator("#firmwareProgress").wait_for()
+        assert picker.is_disabled()
+        assert page.locator("#btnReboot").is_disabled()
+        assert page.locator("#btnFactory").is_disabled()
+        assert page.locator("#btnSaveTz").is_disabled()
+        status_count = server.status_count
+        page.evaluate("refresh()")
+        assert server.status_count == status_count
+    finally:
+        server.firmware_release.set()
+    page.get_by_text("固件包不适用于此设备型号。", exact=True).wait_for()
+    assert server.firmware_requests == [("Bearer " + token, "application/octet-stream", payload)]
+    assert upload.is_enabled()
+
+    server.firmware_behavior = "drop"
+    upload.click()
+    confirm.click()
+    page.get_by_text("设备可能已经开始重启", exact=False).wait_for()
+    assert "/web" in result.inner_text()
+    assert upload.is_disabled()
+    assert len(server.firmware_requests) == 2
+
+    page.goto(url)
+    system.click()
+    picker.wait_for()
+    picker.set_input_files(package)
+    server.expected_token = "c" * 32
+    upload.click()
+    confirm.click()
+    page.get_by_text("管理授权已失效", exact=False).wait_for()
+    assert page.evaluate("sessionStorage.length") == 0
+    assert len(server.firmware_requests) == 2
+
+    server.expected_token = token
+    server.firmware_behavior = "success"
+    page.goto(url)
+    system.click()
+    picker.wait_for()
+    picker.set_input_files(package)
+    upload.click()
+    confirm.click()
+    page.get_by_text("设备已接受固件 1.2.4", exact=False).wait_for()
+    assert "/web" in result.inner_text()
+    assert len(server.firmware_requests) == 3
+    page.goto(url)
+    system.click()
+    page.get_by_text("当前版本 1.2.4 · test-board", exact=True).wait_for()
+    page.set_viewport_size({"width": 375, "height": 812})
+    assert page.evaluate("document.documentElement.scrollWidth === window.innerWidth")
+    page.set_viewport_size({"width": 1280, "height": 900})
 
 
 def test_factory_reset(page, server) -> None:
@@ -444,6 +556,7 @@ def main() -> None:
             page.get_by_text("卡槽配置已保存", exact=False).wait_for()
             page.get_by_role("button", name="系统", exact=True).click()
             assert page.locator("#btnFactory").is_hidden()
+            assert page.locator("#firmwarePanel").is_hidden()
             assert page.locator("#factoryLanOnly").is_visible()
             page.locator("#tz").fill("9")
             page.get_by_role("button", name="保存时区").click()

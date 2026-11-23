@@ -32,6 +32,7 @@
 #include "runtime.h"
 #include "power_policy.h"
 #include "factory_reset.h"
+#include "firmware_update.h"
 #include "ble_lifecycle_policy.h"
 
 static const char *TAG = "app";
@@ -263,8 +264,8 @@ static void net_task(void *arg)
         int64_t now = esp_timer_get_time() / 1000;
         bool has_ip = wifi_connected();
         if (had_ip && !has_ip) {
-            feishu_ws_stop();
             lan_web_stop();
+            feishu_ws_stop();
             lan_started = false;
             lan_start_retry_at = 0;
             lan_start_retry_ms = 1000;
@@ -281,6 +282,17 @@ static void net_task(void *arg)
                     ? wifi_start_retry_ms * 2 : 30000;
             }
         }
+        if (has_ip && !lan_started && now >= lan_start_retry_at) {
+            esp_err_t web_err = lan_web_start();
+            if (web_err == ESP_OK) {
+                lan_started = true;
+                lan_start_retry_ms = 1000;
+            } else {
+                ESP_LOGW(TAG, "LAN management server start deferred (%s)", esp_err_to_name(web_err));
+                lan_start_retry_at = now + lan_start_retry_ms;
+                lan_start_retry_ms = lan_start_retry_ms < 15000 ? lan_start_retry_ms * 2 : 30000;
+            }
+        }
         if (has_ip && !ntp_started) { sntp_start(); ntp_started = true; }
         bool online = has_ip && time_synced() && feishu_ws_connected();
         if (has_ip && time_synced() && feishu_configured() && !feishu_ws_connected() && now >= fs_retry_at) {
@@ -292,17 +304,6 @@ static void net_task(void *arg)
             rpc_complete_setup()) {
             ESP_LOGI(TAG, "Wi-Fi and authenticated Feishu websocket are online; closing BLE setup");
             ble_lockdown();
-        }
-        if (has_ip && !lan_started && now >= lan_start_retry_at) {
-            esp_err_t web_err = lan_web_start();
-            if (web_err == ESP_OK) {
-                lan_started = true;
-                lan_start_retry_ms = 1000;
-            } else {
-                ESP_LOGW(TAG, "LAN management server start deferred (%s)", esp_err_to_name(web_err));
-                lan_start_retry_at = now + lan_start_retry_ms;
-                lan_start_retry_ms = lan_start_retry_ms < 15000 ? lan_start_retry_ms * 2 : 30000;
-            }
         }
         if (online && !was_online) sms_retry_pending();
         was_online = online;
@@ -327,6 +328,7 @@ static void on_peer_learned(const char *open_id, const char *chat_id)
 
 void app_main(void)
 {
+    firmware_boot_check_start(lan_web_ready);
     esp_err_t pm_err = power_policy_init();
     if (pm_err != ESP_OK) {
         ESP_LOGW(TAG, "power policy unavailable (%s)", esp_err_to_name(pm_err));
@@ -428,4 +430,6 @@ void app_main(void)
         health_start(s_modems);
     }
     ble_start();
+    if (storage_err == ESP_OK && rpc_err == ESP_OK && !s_safe_mode)
+        firmware_boot_check_ready();
 }

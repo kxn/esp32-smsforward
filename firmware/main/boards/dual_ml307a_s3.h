@@ -1,5 +1,7 @@
 #pragma once
 
+#include "board_identity.h"
+
 #define MODEM_COUNT 2
 
 static const modem_pin_t MODEM_PINS[MODEM_COUNT] = {

@@ -588,6 +588,16 @@
         gap: 10px;
         flex-wrap: wrap;
       }
+      #firmwareProgress {
+        display: block;
+        width: 100%;
+        margin-top: 12px;
+      }
+      #firmwarePicker[hidden],
+      #firmwareActions[hidden],
+      #firmwareProgress[hidden] {
+        display: none;
+      }
       .field-note {
         margin: 8px 0 0;
         color: var(--muted);
@@ -1122,6 +1132,19 @@
             </button>
           </div>
         </section>
+        <section class="panel" id="firmwarePanel" style="margin-top: 14px" hidden>
+          <h2 class="section-title">固件更新</h2>
+          <p class="view-sub" id="firmwareVersion"></p>
+          <div class="field" id="firmwarePicker" hidden>
+            <label for="firmwareFile">固件包（.smsfw）</label>
+            <input class="input" id="firmwareFile" type="file" accept=".smsfw" />
+          </div>
+          <div class="actions" id="firmwareActions" hidden>
+            <button class="button button-primary" id="btnFirmware" type="button">上传并更新</button>
+          </div>
+          <progress id="firmwareProgress" aria-label="固件包上传进度" max="100" hidden></progress>
+          <p class="view-sub" id="firmwareResult" role="status"></p>
+        </section>
         <section class="panel" style="margin-top: 14px">
           <h2 class="section-title">设备操作</h2>
           <div class="system-actions">
@@ -1154,6 +1177,14 @@
         <button class="button button-danger" type="submit" value="confirm">确认恢复出厂</button>
       </form>
     </dialog>
+    <dialog class="factory-dialog" id="firmwareDialog" aria-labelledby="firmwareTitle" aria-describedby="firmwareDescription">
+      <h2 class="section-title" id="firmwareTitle">更新固件？</h2>
+      <p id="firmwareDescription"></p>
+      <form class="actions" id="firmwareForm" method="dialog">
+        <button class="button" type="submit" value="cancel" autofocus>取消</button>
+        <button class="button button-primary" type="submit" value="confirm">确认上传</button>
+      </form>
+    </dialog>
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       "use strict";
@@ -1184,6 +1215,9 @@
         transport: "ble",
         lanToken: "",
         factoryPending: false,
+        deviceActions: new Set(),
+        firmware: null,
+        firmwarePhase: "",
       };
       const $ = (id) => document.getElementById(id);
       const drafts = new Map();
@@ -1222,12 +1256,10 @@
         $("btnConnect").textContent = on ? "断开连接" : "连接设备";
         $("btnConnect").disabled = S.connecting;
         $("btnConnect").hidden = S.transport === "lan";
-        for (const b of document.querySelectorAll("[data-device-action]"))
-          b.disabled = !on;
-        updateFactoryControl();
+        updateDeviceControls();
         renderSetupGuide();
         if (on) {
-          startStatusTimer();
+          if (!S.firmwarePhase) startStatusTimer();
           $("overviewSub").textContent = "正在读取状态";
           $("monitorStatus").textContent = "正在读取监控数据…";
           syncTelemetryPolling();
@@ -1430,8 +1462,9 @@
         document.querySelector("main").hidden = true;
         $("lanGateMessage").textContent = message;
         $("lanGate").hidden = false;
-        for (const b of document.querySelectorAll("[data-device-action]")) b.disabled = true;
-        updateFactoryControl();
+        S.firmware = null;
+        $("firmwareFile").value = "";
+        updateDeviceControls();
         renderSetupGuide();
       }
       function clearLanToken() {
@@ -1538,6 +1571,13 @@
       }
       window.addEventListener("hashchange", () => {
         if (S.transport === "lan" && new URLSearchParams(location.hash.slice(1)).has("token")) {
+          if (S.firmwarePhase === "uploading") {
+            history.replaceState(null, "", location.pathname + location.search);
+            return;
+          }
+          S.firmwarePhase = "";
+          $("firmwareProgress").hidden = true;
+          $("firmwareResult").textContent = "";
           detectLanTransport();
         }
       });
@@ -1552,6 +1592,7 @@
         S.statusTimer = null;
       }
       function refresh(afterSave = false) {
+        if (S.firmwarePhase) return;
         if (afterSave) S.statusVersion++;
         if (S.statusRefresh) return afterSave ? S.statusRefresh.then(() => refresh()) : S.statusRefresh;
         const version = S.statusVersion;
@@ -1574,7 +1615,7 @@
         return S.statusRefresh;
       }
       function telemetryActive() {
-        return S.connected && S.view === "overview" && !document.hidden && S.telemetrySupported;
+        return S.connected && !S.firmwarePhase && S.view === "overview" && !document.hidden && S.telemetrySupported;
       }
       function scheduleTelemetry(delay) {
         S.telemetryTimer = setTimeout(pollTelemetry, delay);
@@ -1749,6 +1790,8 @@
           wifi = d.wifi || {},
           fs = d.feishu || {},
           time = d.time || {};
+        S.firmware = d.firmware || null;
+        updateFirmwareControl();
         renderSetupGuide(d);
         renderSlot(0, slots[0]);
         renderSlot(1, slots[1]);
@@ -1834,15 +1877,17 @@
       }
       function busy(btn, working, fn) {
         return async () => {
-          if (!S.connected) return;
+          if (!S.connected || S.firmwarePhase || S.deviceActions.has(btn)) return;
           const label = btn.textContent;
-          btn.disabled = true;
+          S.deviceActions.add(btn);
+          updateDeviceControls();
           btn.textContent = working;
           try {
             await fn();
           } finally {
             btn.textContent = label;
-            btn.disabled = !S.connected;
+            S.deviceActions.delete(btn);
+            updateDeviceControls();
           }
         };
       }
@@ -1994,7 +2039,8 @@
           } catch (e) {
             toast("设备正在重启", "ok");
           }
-          setTimeout(() => setConn(false), 900);
+          await new Promise((resolve) => setTimeout(resolve, 900));
+          setConn(false);
         }),
       );
       function canResetFactory() {
@@ -2003,21 +2049,153 @@
       function updateFactoryControl() {
         const allowed = canResetFactory();
         $("btnFactory").hidden = !allowed;
-        $("btnFactory").disabled = !allowed || S.factoryPending;
+        $("btnFactory").disabled = !allowed || S.factoryPending || Boolean(S.firmwarePhase);
         $("factoryLanOnly").hidden = S.transport === "lan";
         if (!allowed && $("factoryDialog").open) $("factoryDialog").close();
       }
+      function updateDeviceControls() {
+        for (const button of document.querySelectorAll("[data-device-action]")) {
+          button.disabled = !S.connected || Boolean(S.firmwarePhase) || S.deviceActions.has(button);
+        }
+        updateFactoryControl();
+        updateFirmwareControl();
+      }
+      function firmwareReady() {
+        return canResetFactory() && typeof S.firmware?.version === "string" && S.firmware.can_upload === true &&
+          !S.firmwarePhase && !S.factoryPending && !S.deviceActions.size;
+      }
+      function updateFirmwareControl() {
+        const visible = canResetFactory() && typeof S.firmware?.version === "string";
+        const supported = visible && S.firmware.can_upload === true;
+        $("firmwarePanel").hidden = !visible;
+        $("firmwarePicker").hidden = !supported;
+        $("firmwareActions").hidden = !supported;
+        if (visible) {
+          const board = S.firmware.board ? " · " + S.firmware.board : "";
+          $("firmwareVersion").textContent = "当前版本 " + S.firmware.version + board +
+            (supported ? "" : " · 当前设备无法上传固件");
+        }
+        const ready = firmwareReady();
+        $("firmwareFile").disabled = !ready;
+        $("btnFirmware").disabled = !ready || !$("firmwareFile").files.length;
+        if (!ready && $("firmwareDialog").open) $("firmwareDialog").close();
+      }
+      const firmwareErrors = {
+        same_origin_required: "请从设备的局域网管理页上传。",
+        octet_stream_required: "设备未收到正确的固件包格式。",
+        firmware_size: "固件包大小超出设备允许的范围。",
+        invalid_package: "固件包格式无效。",
+        wrong_board: "固件包不适用于此设备型号。",
+        invalid_image: "固件镜像无效。",
+        checksum_mismatch: "固件包校验失败，请重新获取固件包。",
+        body_incomplete: "固件包传输不完整，请检查 Wi-Fi 后重试。",
+        firmware_busy: "设备正在处理另一项更新，请等待设备恢复后再核对版本。",
+        firmware_unavailable: "设备当前无法更新固件。",
+        firmware_write: "设备写入固件失败。",
+        firmware_select: "设备未能启用新固件。",
+        memory: "设备资源不足，请稍后重试。",
+      };
+      function uploadFirmware(file, token) {
+        return new Promise((resolve, reject) => {
+          const request = new XMLHttpRequest();
+          const progress = $("firmwareProgress");
+          request.open("POST", "/api/firmware");
+          request.timeout = 180000;
+          request.responseType = "json";
+          request.setRequestHeader("Authorization", "Bearer " + token);
+          request.setRequestHeader("Content-Type", "application/octet-stream");
+          request.upload.onprogress = (event) => {
+            if (event.lengthComputable) progress.value = 100 * event.loaded / event.total;
+          };
+          request.upload.onload = () => {
+            progress.value = 100;
+            $("firmwareResult").textContent = "上传完成，正在等待设备校验并写入固件…";
+          };
+          request.onload = () => resolve(request);
+          request.onerror = request.ontimeout = request.onabort = reject;
+          request.send(file);
+        });
+      }
+      $("firmwareFile").addEventListener("change", () => {
+        const file = $("firmwareFile").files[0];
+        $("firmwareResult").textContent = "";
+        $("firmwareProgress").hidden = true;
+        if (file && (!/\.smsfw$/i.test(file.name) || file.size === 0)) {
+          $("firmwareFile").value = "";
+          $("firmwareResult").textContent = "请选择有效的 .smsfw 固件包。";
+        }
+        updateFirmwareControl();
+      });
+      $("btnFirmware").addEventListener("click", () => {
+        const file = $("firmwareFile").files[0];
+        if (!firmwareReady() || !file || $("firmwareDialog").open) return;
+        $("firmwareDescription").textContent = `当前版本 ${S.firmware.version}。将上传 ${file.name}，设备验证通过后会重启。更新期间请保持设备供电和 Wi-Fi 连接。`;
+        $("firmwareDialog").showModal();
+      });
+      $("firmwareForm").addEventListener("submit", async (event) => {
+        if (event.submitter?.value !== "confirm") return;
+        event.preventDefault();
+        const file = $("firmwareFile").files[0];
+        if (!firmwareReady() || !file || !$("firmwareDialog").open) return;
+        const token = S.lanToken;
+        const progress = $("firmwareProgress");
+        const result = $("firmwareResult");
+        S.firmwarePhase = "uploading";
+        updateDeviceControls();
+        stopStatusTimer();
+        stopTelemetryPolling();
+        progress.removeAttribute("value");
+        progress.hidden = false;
+        result.textContent = "正在上传固件包…";
+        const checkVersion = "请等待设备启动，在飞书私聊发送 /web 获取新链接，然后在系统页核对当前版本。";
+        try {
+          await S.statusRefresh;
+          if (S.lanToken !== token) {
+            S.firmwarePhase = "";
+            return;
+          }
+          const request = await uploadFirmware(file, token);
+          const reply = request.response;
+          if (request.status === 401 || (request.status === 403 && reply?.err !== "same_origin_required")) {
+            S.firmwarePhase = "";
+            lockLan("管理授权已失效，请在飞书私聊发送 /web 获取新链接后重新选择固件包");
+          } else if (request.status >= 200 && request.status < 300 && reply?.ok === true) {
+            S.firmwarePhase = "restart";
+            const version = typeof reply.version === "string" ? " " + reply.version : "";
+            result.textContent = "设备已接受固件" + version + "，即将重启。" + checkVersion;
+          } else if (reply?.err === "firmware_busy") {
+            S.firmwarePhase = "restart";
+            result.textContent = firmwareErrors.firmware_busy + checkVersion;
+          } else if (reply?.ok === false && typeof reply.err === "string") {
+            S.firmwarePhase = "";
+            result.textContent = firmwareErrors[reply.err] || "设备拒绝了固件包，请核对文件后重试。";
+          } else {
+            S.firmwarePhase = "restart";
+            result.textContent = "设备返回了无法确认的更新结果。" + checkVersion;
+          }
+        } catch {
+          S.firmwarePhase = "restart";
+          result.textContent = "连接中断或响应超时，设备可能已经开始重启。" + checkVersion;
+        } finally {
+          progress.hidden = true;
+          updateDeviceControls();
+          if (S.connected && !S.firmwarePhase) {
+            startStatusTimer();
+            syncTelemetryPolling();
+          }
+        }
+      });
       $("btnFactory").addEventListener("click", () => {
-        if (canResetFactory() && !S.factoryPending && !$("factoryDialog").open) {
+        if (canResetFactory() && !S.factoryPending && !S.firmwarePhase && !$("factoryDialog").open) {
           $("factoryDialog").showModal();
         }
       });
       $("factoryForm").addEventListener("submit", async (event) => {
         if (event.submitter?.value !== "confirm") return;
         event.preventDefault();
-        if (!canResetFactory() || S.factoryPending || !$("factoryDialog").open) return;
+        if (!canResetFactory() || S.factoryPending || S.firmwarePhase || !$("factoryDialog").open) return;
         S.factoryPending = true;
-        updateFactoryControl();
+        updateDeviceControls();
         $("factoryDialog").close();
         try {
           const r = await rpc({ cmd: "factory_reset", confirm: true });
@@ -2032,7 +2210,7 @@
           toast(deviceError(e.message), "bad");
         } finally {
           S.factoryPending = false;
-          updateFactoryControl();
+          updateDeviceControls();
         }
       });
       document

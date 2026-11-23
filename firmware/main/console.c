@@ -1,4 +1,5 @@
 #include "console.h"
+#include "firmware_update.h"
 #include "pdu.h"
 #include "sms.h"
 #include "pbbp2.h"
@@ -389,6 +390,10 @@ static void handle_line(char *line)
         cfg_save();
         printf("\nsaved\n");
     } else if (!strcmp(line, "reboot")) {
+        if (!firmware_restart_reserve()) {
+            printf("\nfirmware operation in progress\n");
+            return;
+        }
         printf("\nrebooting...\n");
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(200));

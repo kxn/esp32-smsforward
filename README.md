@@ -2,7 +2,7 @@
 
 把插在设备里的 SIM 卡收到的短信、来电和彩信到达提醒发到飞书私聊。你可以在飞书里发短信、引用原通知回短信、管理无条件呼叫转移，也可以打开设备的局域网管理页。设备通过 Wi‑Fi 直接连接飞书。
 
-本文适用于 v1.2 及更新固件。
+本文适用于 v1.3 及更新固件。
 
 ## 开始前
 
@@ -129,9 +129,26 @@
 
 ## 升级与恢复
 
-1. 从发布页下载与硬件匹配的新固件，先看该版本的发布说明。当前通过 USB 升级。 [GitHub Releases](https://github.com/kxn/esp32-smsforward/releases)
-2. 升级前按刷机章节保存本机整片备份。使用新版本随包提供的 `flash_args` 一次写入。按当前分区布局刷写时会保留 Wi‑Fi、飞书凭证和历史映射。
-3. 正常启动后，发 `/help`、`/sims`、`/web` 确认状态，再用备用手机发送一条测试短信。
+### 从 v1.1 或 v1.2 升级到 v1.3
+
+从发布页下载 `esp32-smsforward-s3-ml307a.zip`，按第 1 节用 USB 刷入一次 v1.3，安装支持网页升级的分区表和引导程序。按包内 `flash_args` 写入会保留 Wi-Fi、飞书凭证和历史映射。刷写和升级均不要运行 `erase-flash`。 [GitHub Releases](https://github.com/kxn/esp32-smsforward/releases)
+
+刷写前请保留本机的整片备份。已有原厂整片备份可用于恢复原厂状态。v1.3 将原厂 FAT 所在的尾部区域用于第二个应用槽，第一次网页升级写入该槽时会覆盖原厂数据。如果只需另外保留当前尾部区域，可在转换前按以下命令读取并妥善保存。恢复原厂固件仍需原厂整片备份。
+
+```sh
+python -m esptool --chip esp32s3 --port COM3 read-flash 0x600000 0x200000 factory-tail-backup.bin
+```
+
+### 从 v1.3 或更新版本通过网页升级
+
+1. 在需要升级的版本附件中下载适配双 ML307A 板的 `esp32-smsforward-s3-ml307a.smsfw`，或从同版 USB ZIP 中解压该文件。 [GitHub Releases](https://github.com/kxn/esp32-smsforward/releases)
+2. 在设备已绑定的飞书私聊发送 `/web`，打开局域网管理页。进入「系统 → 固件更新」，选择「固件包（.smsfw）」，点击「上传并更新」，再点击「确认上传」。
+3. 上传时保持局域网和设备供电。设备验证并写入备用应用槽后重启，Wi-Fi、飞书凭证和历史映射保存在独立分区。
+4. 设备重连飞书后再次发送 `/web`，在「系统 → 固件更新」查看「当前版本」。也可发送 `/help`、`/sims` 并用备用手机发一条测试短信，确认日常功能恢复。
+
+首次启动新版本时，设备会检查存储、配置服务和局域网管理是否就绪，并等待设备获得局域网 IP。若约两分钟内仍无法通过检查，例如 Wi-Fi 接入点暂时不可达，设备会回到之前的版本。请在网络恢复后重新获取 `/web` 链接并核对版本。
+
+网页升级使用发布页的 `.smsfw` 文件。ZIP、原始 `.bin` 和整片备份用于 USB 刷写或恢复。网页无法打开时，可用 USB 和目标版本随包提供的 `flash_args` 恢复。
 
 ### 用 USB 控制台修正离线设备的配置
 
@@ -186,8 +203,11 @@ python -m esptool --chip esp32s3 --port COM3 --baud 115200 write-flash 0x0 my-de
 cd firmware
 idf.py set-target esp32s3
 idf.py build
+python ../tools/pack_update.py build
 idf.py -p COM3 flash monitor
 ```
+
+打包命令在当前目录生成 `esp32-smsforward-s3-ml307a.smsfw`，可选择在命令末加上自定义的 `.smsfw` 输出路径。请传入本次构建使用的目录。如果用 `idf.py -B <目录>` 构建，打包时也传入该目录。打包工具会核对镜像中的项目、版本和板型标识，以及构建出的分区表。
 
 切换硬件前，请核对模组型号、UART 与复位引脚、Flash 分区及 PSRAM 容量。当前双 ML307A 板的引脚表在 [boards/dual_ml307a_s3.h](firmware/main/boards/dual_ml307a_s3.h)，内存与 Flash 参数在 [sdkconfig.defaults.esp32s3](firmware/sdkconfig.defaults.esp32s3)。C3 版需要独立板级配置和实机验证。
 

@@ -1,10 +1,12 @@
 #include "lan_web.h"
 
 #include "factory_reset.h"
+#include "firmware_update.h"
 #include "rpc.h"
 #include "wifi.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,11 +16,13 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 static const char *TAG = "lan_web";
 static httpd_handle_t s_server;
+static atomic_bool s_available;
 static SemaphoreHandle_t s_lock;
 static char s_token[33];
 
@@ -169,6 +173,81 @@ static esp_err_t rpc_post(httpd_req_t *req)
     return sent;
 }
 
+typedef struct {
+    httpd_req_t *request;
+    int64_t deadline_us;
+} upload_request_t;
+
+static int read_firmware(void *ctx, void *buf, size_t len)
+{
+    const upload_request_t *upload = ctx;
+    if (esp_timer_get_time() >= upload->deadline_us) return -1;
+    return httpd_req_recv(upload->request, buf, len);
+}
+
+static esp_err_t send_upload_error(httpd_req_t *req, const char *status, const char *json)
+{
+    /* Close instead of draining a rejected, potentially oversized request body. */
+    httpd_resp_set_hdr(req, "Connection", "close");
+    send_json_status(req, status, json);
+    return ESP_FAIL;
+}
+
+static esp_err_t firmware_post(httpd_req_t *req)
+{
+    if (!request_same_origin(req))
+        return send_upload_error(req, "403 Forbidden", "{\"ok\":false,\"err\":\"same_origin_required\"}");
+    if (!request_has_token(req))
+        return send_upload_error(req, "401 Unauthorized", "{\"ok\":false,\"err\":\"unauthorized\"}");
+
+    char content_type[32];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK ||
+        strcasecmp(content_type, "application/octet-stream") != 0 ||
+        httpd_req_get_hdr_value_len(req, "Transfer-Encoding") ||
+        httpd_req_get_hdr_value_len(req, "Content-Encoding"))
+        return send_upload_error(req, "415 Unsupported Media Type", "{\"ok\":false,\"err\":\"octet_stream_required\"}");
+
+    static const struct {
+        const char *status;
+        const char *name;
+    } errors[] = {
+        [FIRMWARE_BUSY] = {"409 Conflict", "firmware_busy"},
+        [FIRMWARE_UNAVAILABLE] = {"409 Conflict", "firmware_unavailable"},
+        [FIRMWARE_SIZE] = {"413 Content Too Large", "firmware_size"},
+        [FIRMWARE_PACKAGE] = {"400 Bad Request", "invalid_package"},
+        [FIRMWARE_BOARD_MISMATCH] = {"400 Bad Request", "wrong_board"},
+        [FIRMWARE_IMAGE] = {"400 Bad Request", "invalid_image"},
+        [FIRMWARE_CHECKSUM] = {"400 Bad Request", "checksum_mismatch"},
+        [FIRMWARE_INCOMPLETE] = {"408 Request Timeout", "body_incomplete"},
+        [FIRMWARE_WRITE] = {"500 Internal Server Error", "firmware_write"},
+        [FIRMWARE_SELECT] = {"500 Internal Server Error", "firmware_select"},
+        [FIRMWARE_MEMORY] = {"503 Service Unavailable", "memory"},
+    };
+    upload_request_t upload = { .request = req, .deadline_us = esp_timer_get_time() + 90000000 };
+    char version[FIRMWARE_VERSION_SIZE];
+    firmware_result_t result = firmware_upload(req->content_len, read_firmware, &upload, version);
+    if (result != FIRMWARE_OK) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"ok\":false,\"err\":\"%s\"}", errors[result].name);
+        return send_upload_error(req, errors[result].status, body);
+    }
+
+    /* The validator allows only printable ASCII. Escape JSON's two special characters. */
+    char escaped[2 * FIRMWARE_VERSION_SIZE];
+    size_t n = 0;
+    for (const char *p = version; *p; ++p) {
+        if (*p == '"' || *p == '\\') escaped[n++] = '\\';
+        escaped[n++] = *p;
+    }
+    escaped[n] = '\0';
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"version\":\"%s\"}", escaped);
+
+    esp_err_t sent = send_json_status(req, "200 OK", body);
+    rpc_run_post_reply_action(RPC_POST_RESTART);
+    return sent;
+}
+
 static bool create_token_locked(void)
 {
     if (s_token[0]) return true;
@@ -199,7 +278,7 @@ esp_err_t lan_web_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
-    config.max_uri_handlers = 5;
+    config.max_uri_handlers = 6;
     config.max_open_sockets = 3;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 5;
@@ -215,19 +294,23 @@ esp_err_t lan_web_start(void)
     const httpd_uri_t index = { .uri = "/index.html", .method = HTTP_GET, .handler = page_get };
     const httpd_uri_t info = { .uri = "/api/info", .method = HTTP_GET, .handler = api_info_get };
     const httpd_uri_t rpc = { .uri = "/api/rpc", .method = HTTP_POST, .handler = rpc_post };
+    const httpd_uri_t upload = { .uri = "/api/firmware", .method = HTTP_POST, .handler = firmware_post };
     const httpd_uri_t rpc_get = { .uri = "/api/rpc", .method = HTTP_GET, .handler = rpc_method_not_allowed };
     if ((err = httpd_register_uri_handler(server, &page)) != ESP_OK ||
         (err = httpd_register_uri_handler(server, &index)) != ESP_OK ||
         (err = httpd_register_uri_handler(server, &info)) != ESP_OK ||
         (err = httpd_register_uri_handler(server, &rpc)) != ESP_OK ||
+        (err = httpd_register_uri_handler(server, &upload)) != ESP_OK ||
         (err = httpd_register_uri_handler(server, &rpc_get)) != ESP_OK) {
         httpd_stop(server);
         ESP_LOGE(TAG, "route registration failed (%s)", esp_err_to_name(err));
         return err;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (!s_server) s_server = server;
-    else {
+    if (!s_server) {
+        s_server = server;
+        atomic_store(&s_available, true);
+    } else {
         xSemaphoreGive(s_lock);
         httpd_stop(server);
         return ESP_OK;
@@ -243,11 +326,17 @@ void lan_web_stop(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     httpd_handle_t server = s_server;
     s_server = NULL;
+    atomic_store(&s_available, false);
     xSemaphoreGive(s_lock);
     if (server) {
         httpd_stop(server);
         ESP_LOGI(TAG, "management server stopped");
     }
+}
+
+bool lan_web_ready(void)
+{
+    return atomic_load(&s_available) && wifi_connected();
 }
 
 bool lan_web_management_url(char *out, size_t cap)

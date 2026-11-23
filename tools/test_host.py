@@ -16,6 +16,7 @@ CASES = {
     ROOT / "tools/test_wap_mms.c": ["wap_mms.c"],
     ROOT / "tools/test_telemetry.c": ["telemetry.c"],
     ROOT / "tools/test_factory_reset.c": ["factory_reset.c"],
+    ROOT / "tools/test_firmware_update.c": ["firmware_update.c"],
     ROOT / "tools/test_ble_lifecycle.c": ["ble_lifecycle_policy.c"],
     ROOT / "tools/test_sms_assembly.c": ["sms_assembly.c"],
     ROOT / "tools/test_sms_seen.c": ["sms_seen.c"],
@@ -37,6 +38,7 @@ CASES = {
 }
 EXTRA_INCLUDES = {
     ROOT / "tools/test_factory_reset.c": [ROOT / "tools/modem_fake"],
+    ROOT / "tools/test_firmware_update.c": [ROOT / "tools/firmware_fake"],
     MAIN / "tests/test_feishu_media_policy.c": [ROOT / "tools/modem_fake"],
     ROOT / "tools/test_modem_transaction_flow.c": [ROOT / "tools/modem_fake"],
     ROOT / "tools/test_mms_fetch.c": [ROOT / "tools/modem_fake"],

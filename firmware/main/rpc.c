@@ -1,6 +1,7 @@
 #include "rpc.h"
 
 #include "ble.h"
+#include "board_identity.h"
 #include "cfg.h"
 #include "wifi.h"
 #include "feishu.h"
@@ -8,6 +9,7 @@
 #include "cmd_policy.h"
 #include "device_status.h"
 #include "factory_reset.h"
+#include "firmware_update.h"
 #include "runtime.h"
 #include "telemetry.h"
 
@@ -165,7 +167,11 @@ static cJSON *status_data(void)
     cJSON *feishu = cJSON_AddObjectToObject(data, "feishu");
     cJSON *wifi = cJSON_AddObjectToObject(data, "wifi");
     cJSON *clock = cJSON_AddObjectToObject(data, "time");
-    if (!slots || !feishu || !wifi || !clock) { cJSON_Delete(data); return NULL; }
+    cJSON *firmware = cJSON_AddObjectToObject(data, "firmware");
+    if (!slots || !feishu || !wifi || !clock || !firmware) { cJSON_Delete(data); return NULL; }
+    cJSON_AddStringToObject(firmware, "version", firmware_version());
+    cJSON_AddStringToObject(firmware, "board", SMSF_BOARD_LAYOUT);
+    cJSON_AddBoolToObject(firmware, "can_upload", firmware_can_upload());
     for (int i = 0; i < 2; ++i) {
         cJSON *slot = cJSON_CreateObject();
         if (!slot) { cJSON_Delete(data); return NULL; }
@@ -287,7 +293,11 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
     } else if (!strcmp(cmd, "factory_reset")) {
         if (via_ble) err = "lan_required";
         else if (!explicit_reset_confirmation(root)) err = "confirm_required";
-        else if (factory_reset_request() != ESP_OK) err = "reset_storage_failed";
+        else if (!firmware_restart_reserve()) err = "firmware_busy";
+        else if (factory_reset_request() != ESP_OK) {
+            firmware_restart_release();
+            err = "reset_storage_failed";
+        }
         else *post_action = RPC_POST_RESTART;
     } else if (!strcmp(cmd, "status")) {
         data = status_data();
@@ -404,7 +414,8 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
             else cfg_apply_timezone();
         }
     } else if (!strcmp(cmd, "reboot")) {
-        if (post_action) *post_action = RPC_POST_RESTART;
+        if (!firmware_restart_reserve()) err = "firmware_busy";
+        else *post_action = RPC_POST_RESTART;
     } else {
         err = "unknown";
     }
