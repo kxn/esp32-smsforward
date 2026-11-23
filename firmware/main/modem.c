@@ -154,19 +154,23 @@ static void rx_task(void *arg)
 {
     modem_t *m = (modem_t *)arg;
     uint8_t buf[256];
+    uart_event_t event;
 
     while (1) {
-        /* Read exactly one byte with an infinite wait: uart_read_bytes waits
-         * for the requested count, so asking for the full buffer would delay
-         * short URCs until it filled. Drain any bytes already queued without
-         * blocking after the first byte wakes this task. */
-        int n = uart_read_bytes(m->uart, buf, 1, portMAX_DELAY);
-        if (n > 0) {
-            int extra = uart_read_bytes(m->uart, buf + n, sizeof(buf) - n, 0);
-            if (extra > 0) n += extra;
-        }
-        for (int i = 0; i < n; i++) {
-            rx_char(m, (char)buf[i]);
+        /* Wait outside the UART RX mutex so reset can flush a silent UART.
+         * Every queued event is a wakeup: the driver can drop data events
+         * when the event queue is full, so drain beyond the event's size. */
+        if (xQueueReceive(m->uart_events, &event, portMAX_DELAY) == pdTRUE) {
+            int n;
+            do {
+                n = uart_read_bytes(m->uart, buf, sizeof(buf), 0);
+                /* Flush can re-enable RX interrupts before releasing the
+                 * driver mutex. Retry a contended read on the same wakeup. */
+                if (n < 0) vTaskDelay(1);
+                for (int i = 0; i < n; i++) {
+                    rx_char(m, (char)buf[i]);
+                }
+            } while (n != 0);
         }
     }
 }
@@ -203,7 +207,7 @@ esp_err_t modem_init(modem_t *m, int idx)
         .source_clk = UART_SCLK_XTAL,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(m->uart, 4096, 2048, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(m->uart, 4096, 2048, 20, &m->uart_events, 0));
     ESP_ERROR_CHECK(uart_param_config(m->uart, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(m->uart, m->pin.tx, m->pin.rx,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));

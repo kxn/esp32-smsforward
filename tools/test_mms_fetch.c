@@ -194,7 +194,9 @@ int uart_write_bytes(uart_port_t uart, const void *data, size_t len)
 
 int uart_read_bytes(uart_port_t uart, void *buf, uint32_t len, uint32_t ticks)
 { (void)uart; (void)buf; (void)len; (void)ticks; return 0; }
-int uart_driver_install(uart_port_t uart, int rx, int tx, int events, void *queue, int flags)
+BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticks)
+{ (void)queue; (void)item; (void)ticks; return pdFALSE; }
+int uart_driver_install(uart_port_t uart, int rx, int tx, int events, QueueHandle_t *queue, int flags)
 { (void)uart; (void)rx; (void)tx; (void)events; (void)queue; (void)flags; return 0; }
 int uart_param_config(uart_port_t uart, const uart_config_t *cfg)
 { (void)uart; g_last_uart_config = *cfg; g_uart_config_seen = true; return 0; }

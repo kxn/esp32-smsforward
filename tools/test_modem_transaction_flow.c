@@ -1,17 +1,24 @@
 /* Compile and execute the production modem.c with fake UART/FreeRTOS edges. */
 #define MODEM_HOST_FAKE
 #include <assert.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../firmware/main/modem.c"
 
 struct fake_sem { int token; int mutex; };
+struct fake_queue { int delivered; };
 static int g_suppress_csq;
 static int g_cmgs_mode; /* 0 prompt/no final, 1 explicit prompt error, 2 no prompt */
 static int g_sms_final_mode; /* 0 none, 1 success, 2 explicit error */
 static int g_at_count, g_payload_count, g_ctrlz_count, g_esc_count, g_urc_count;
 static int g_ignore_next_gt;
+static struct fake_queue g_uart_events;
+static jmp_buf g_rx_task_exit;
+static char g_rx_data[300];
+static size_t g_rx_offset;
+static int g_rx_read_contended, g_flush_count;
 
 enum { CMGS_UNKNOWN, CMGS_PROMPT_ERROR, CMGS_NO_PROMPT };
 enum { SMS_FINAL_NONE, SMS_FINAL_OK, SMS_FINAL_ERROR, SMS_FINAL_OK_ONLY };
@@ -91,13 +98,46 @@ int uart_write_bytes(uart_port_t uart, const void *data, size_t len)
 }
 
 int uart_read_bytes(uart_port_t uart, void *buf, uint32_t len, uint32_t ticks)
-{ (void)uart; (void)buf; (void)len; (void)ticks; return 0; }
-int uart_driver_install(uart_port_t u,int r,int t,int e,void*q,int f)
-{ (void)u;(void)r;(void)t;(void)e;(void)q;(void)f;return 0; }
+{
+    assert(uart == g_modem.uart && ticks == 0);
+    if (g_rx_read_contended) {
+        g_rx_read_contended = 0;
+        return -1;
+    }
+    size_t count = sizeof(g_rx_data) - g_rx_offset;
+    if (count > len) count = len;
+    memcpy(buf, g_rx_data + g_rx_offset, count);
+    g_rx_offset += count;
+    return (int)count;
+}
+
+int uart_driver_install(uart_port_t uart, int rx, int tx, int events, QueueHandle_t *queue, int flags)
+{
+    (void)uart; (void)rx; (void)tx; (void)flags;
+    assert(events > 0 && queue);
+    *queue = &g_uart_events;
+    return 0;
+}
+
+BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticks)
+{
+    assert(queue == &g_uart_events && ticks == portMAX_DELAY);
+    if (!queue->delivered++) {
+        /* One non-data event remains queued after a data event was dropped. */
+        *(uart_event_t *)item = (uart_event_t){ .type = UART_FIFO_OVF };
+        return pdTRUE;
+    }
+    /* Run reset at the point where RX would sleep on a silent UART. */
+    assert(g_rx_offset == sizeof(g_rx_data) && g_urc_count == 1);
+    modem_reset_hw(&g_modem);
+    assert(g_flush_count == 1 && !modem_is_desynced(&g_modem));
+    assert(modem_cmd(&g_modem, "AT+CEREG?", NULL, 0, 10) == ESP_OK);
+    longjmp(g_rx_task_exit, 1);
+}
 int uart_param_config(uart_port_t u,const uart_config_t*c) { (void)u;(void)c;return 0; }
 int uart_set_pin(uart_port_t u,int tx,int rx,int rts,int cts)
 { (void)u;(void)tx;(void)rx;(void)rts;(void)cts;return 0; }
-int uart_flush_input(uart_port_t u) { (void)u; return 0; }
+int uart_flush_input(uart_port_t u) { (void)u; g_flush_count++; return 0; }
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
 int gpio_set_level(int p,int l) { (void)p;(void)l;return 0; }
 BaseType_t xTaskCreate(void (*task)(void *),const char*n,unsigned s,void*a,unsigned p,void*h)
@@ -109,14 +149,19 @@ static void count_urc(modem_t *m, const char *line)
 
 static void init_fake_modem(void)
 {
-    memset(&g_modem, 0, sizeof(g_modem));
-    g_modem.uart = 0;
-    g_modem.pin.name = "fake";
-    g_modem.lock = xSemaphoreCreateMutex();
-    g_modem.done = xSemaphoreCreateBinary();
-    g_modem.prompt = xSemaphoreCreateBinary();
-    g_modem.rx_mux = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    assert(modem_init(&g_modem, 0) == ESP_OK);
     g_modem.urc_cb = count_urc;
+}
+
+static void test_reset_with_silent_uart(void)
+{
+    const char urc[] = "\r\nNO CARRIER\r\n";
+    memset(g_rx_data, ' ', sizeof(g_rx_data));
+    memcpy(g_rx_data + sizeof(g_rx_data) - (sizeof(urc) - 1), urc, sizeof(urc) - 1);
+    g_modem.desynced = true;
+    g_urc_count = 0;
+    g_rx_read_contended = 1;
+    if (setjmp(g_rx_task_exit) == 0) rx_task(&g_modem);
 }
 
 int main(void)
@@ -189,6 +234,7 @@ int main(void)
     payload_before = g_payload_count; ctrlz_before = g_ctrlz_count;
     assert(modem_sms_text(&g_modem, "+15550000001", "body", resp, sizeof(resp), 10) == ESP_FAIL);
     assert(g_payload_count == payload_before + 1 && g_ctrlz_count == ctrlz_before + 1);
+    test_reset_with_silent_uart();
     puts("production modem transaction flow passed");
     return 0;
 }

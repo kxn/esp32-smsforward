@@ -26,6 +26,9 @@ static const modem_pin_t MODEM_PINS[MODEM_COUNT] = {{1,2,3,"fake0",0},{4,5,6,"fa
 #include "freertos/portmacro.h"
 #include "board.h"
 #endif
+#if !defined(MODEM_TXN_HOST_TEST)
+#include "freertos/queue.h"
+#endif
 
 /* BUSY means no AT bytes were sent. DESYNC means the safe boundary probe
  * failed, so no command was sent. SUBMIT_UNKNOWN means Ctrl-Z was sent but no
@@ -95,6 +98,7 @@ struct modem_s {
     int idx;
     modem_pin_t pin;
     uart_port_t uart;
+    QueueHandle_t uart_events;
     SemaphoreHandle_t lock;
     SemaphoreHandle_t mms_lock;
     SemaphoreHandle_t done;
