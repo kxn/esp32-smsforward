@@ -1,0 +1,45 @@
+name: Firmware checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: firmware-checks
+  cancel-in-progress: true
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      # The host suite compiles single modules with the system compiler; it needs no
+      # ESP-IDF toolchain, so it is the cheapest gate on the delivery/recovery logic.
+      - name: Host tests
+        run: python tools/test_host.py
+      - name: Web syntax
+        run: |
+          node -e '
+            const fs = require("fs");
+            const html = fs.readFileSync("web/index.html", "utf8");
+            const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+            if (!blocks.length) throw new Error("no inline script found");
+            new Function(blocks.join("\n"));
+          '
+  browser-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip playwright
+          python -m playwright install --with-deps chromium
+      - name: Console tests
+        run: python tools/test_web.py
