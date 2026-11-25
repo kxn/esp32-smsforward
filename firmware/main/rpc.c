@@ -8,6 +8,9 @@
 #include "cmd.h"
 #include "cmd_policy.h"
 #include "device_status.h"
+#include "net_health.h"
+#include "sms.h"
+#include "sms_spool.h"
 #include "factory_reset.h"
 #include "firmware_update.h"
 #include "runtime.h"
@@ -194,6 +197,24 @@ static cJSON *status_data(void)
     cJSON_AddBoolToObject(feishu, "configured", feishu_configured());
     cJSON_AddBoolToObject(feishu, "bound", cfg->open_id[0] || cfg->chat_id[0]);
     cJSON_AddStringToObject(feishu, "app_id", cfg->app_id);
+    /* Diagnostics: "connected but silent" and "still retrying" used to look
+     * identical from the outside, which made the 30 h outage invisible. */
+    cJSON_AddBoolToObject(feishu, "alive", feishu_ws_alive());
+    cJSON_AddNumberToObject(feishu, "rx_age_ms", (double)feishu_ws_rx_age_ms());
+    cJSON_AddNumberToObject(feishu, "connected_ms", (double)feishu_ws_connected_age_ms());
+    cJSON_AddNumberToObject(feishu, "reconnects", feishu_ws_reconnects());
+    cJSON_AddNumberToObject(feishu, "send_fail_streak", (double)feishu_send_fail_streak());
+    cJSON *net = cJSON_AddObjectToObject(data, "net");
+    if (net) net_health_status_json(net);
+    cJSON *spool = cJSON_AddObjectToObject(data, "spool");
+    if (spool) sms_spool_status_json(spool);
+    cJSON *sms = cJSON_AddObjectToObject(data, "sms");
+    if (sms) {
+        /* journal_ok=false means dedup is degraded (possible duplicate forward after
+         * a crash); sweep_ms shows how far the idle SIM sweep has backed off. */
+        cJSON_AddBoolToObject(sms, "journal_ok", sms_journal_ok());
+        cJSON_AddNumberToObject(sms, "sweep_ms", (double)sms_sweep_delay_ms());
+    }
     cJSON_AddStringToObject(wifi, "ssid", ssid);
     cJSON_AddStringToObject(wifi, "ip", ip);
     cJSON_AddNumberToObject(wifi, "rssi", rssi);
@@ -452,6 +473,9 @@ void rpc_run_post_reply_action(rpc_post_reply_action_t action)
         network_config_changed();
         if (err != ESP_OK) ESP_LOGW(TAG, "saved Wi-Fi config could not be applied (%d)", (int)err);
     } else if (action == RPC_POST_RESTART) {
+        /* Do not restart on top of unsent events: a firmware update that reboots
+         * during an outage must not lose the parked SMS/call notices. */
+        sms_spool_persist();
         vTaskDelay(pdMS_TO_TICKS(300));
         esp_restart();
     }

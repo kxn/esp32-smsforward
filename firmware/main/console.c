@@ -1,5 +1,6 @@
 #include "console.h"
 #include "firmware_update.h"
+#include "sms_spool.h"
 #include "pdu.h"
 #include "sms.h"
 #include "pbbp2.h"
@@ -406,9 +407,11 @@ static void cmd_help(void)
            "m1 <AT>         向模组1发 AT\n"
            "m2 <AT>         向模组2发 AT\n"
            "p1 / p2 / pa    探活序列（pa=两张卡）\n"
+           "net             网络、飞书长连接与上行探测状态\n"
            "wifi <ssid> <pass>        设置 Wi-Fi\n"
            "fset <app_id> <app_secret> 设置飞书应用\n"
            "r1 / r2         硬件复位模组\n"
+           "reboot          重启设备（保留待补发缓存）\n"
            "sms1 <num> <txt> 用模组1发短信（后续版本）\n"
            "\n");
 }
@@ -463,6 +466,8 @@ static void handle_line(char *line)
             printf("\nfirmware operation in progress\n");
             return;
         }
+        /* Keep parked events across the restart. */
+        sms_spool_persist();
         printf("\nrebooting...\n");
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(200));
