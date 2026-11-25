@@ -4,6 +4,7 @@
 #include "feishu_proto.h"
 #include "feishu_event_dedup.h"
 #include "feishu_retry_policy.h"
+#include "feishu_auth_policy.h"
 #include "feishu_media_policy.h"
 
 #include <stdio.h>
@@ -36,6 +37,11 @@ static bool s_cfg_initialized;
 static volatile uint32_t s_cfg_generation;
 static char s_token[256];
 static int64_t s_token_expire_ms;
+/* Bumped whenever the configuration changes.  token_get() treats a token that
+ * was filled for an older epoch as absent, which is how feishu_init() invalidates
+ * the cache without ever taking s_token_lock (see feishu_init()). */
+static volatile uint32_t s_token_epoch;
+static uint32_t s_token_fill_epoch;    /* epoch s_token was fetched for; s_token_lock */
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_ws_lock;
 static SemaphoreHandle_t s_ws_lifecycle_lock;
@@ -45,6 +51,10 @@ static feishu_peer_cb_t s_peer_cb;
 static esp_websocket_client_handle_t s_ws;
 static volatile bool s_ws_connected;
 static volatile int s_ws_reconnects;
+/* Epoch of the last session already counted in s_ws_reconnects: ERROR,
+ * DISCONNECTED, CLOSED and FINISH can all describe the same dead session, so the
+ * counter advances once per session instead of once per event. */
+static volatile uint32_t s_ws_counted_epoch;
 static int s_ping_interval = 120;
 static char s_ws_url[512];
 static int s_service_id;
@@ -55,6 +65,24 @@ static int64_t s_ws_retry_at_ms;
 static volatile uint32_t s_ws_epoch;
 static volatile uint32_t s_ws_cfg_generation;
 static volatile uint32_t s_ws_online_epoch;
+/* Liveness bookkeeping for the long connection.  The two 64-bit stamps are
+ * written from the WebSocket task (event handler) and read from net_task, the
+ * health task and rpc, so they are copied under a tiny critical section: 32-bit
+ * Xtensa has no atomic 64-bit load/store and a torn read would flip a healthy
+ * session to "dead".  They are NOT written under s_ws_lock because the event
+ * handler must never block behind a send. */
+static SemaphoreHandle_t s_token_lock;
+static portMUX_TYPE s_ws_liveness_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_ws_connected_ms;    /* when CONNECTED arrived */
+static int64_t s_ws_last_ctrl_ms;    /* last frame of any kind, incl. WS ping/pong */
+static int64_t s_ws_last_app_ms;     /* last application frame (pong or event) */
+static volatile bool s_ws_forced_dead;
+/* Consecutive REST failures, written by the two send paths in this file and read
+ * by sms.c (to park a delivery) and rpc.c (status page); the health supervisor
+ * does not consult it. */
+static volatile uint32_t s_send_fail_streak;
+
+#define WS_RECREATE_MIN_AGE_MS 20000
 
 static void ws_epoch_advance(void)
 {
@@ -62,10 +90,112 @@ static void ws_epoch_advance(void)
     if (!s_ws_epoch) s_ws_epoch++;
 }
 
+/* 64-bit, read under s_ws_lock by feishu_ws_start(): writes go through here so
+ * the fetch-failure paths (which run without any session lock) stay consistent. */
+static void ws_retry_later(int64_t delay_ms)
+{
+    int64_t at = esp_timer_get_time() / 1000 + delay_ms;
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    s_ws_retry_at_ms = at;
+    xSemaphoreGive(s_ws_lock);
+}
+
+/* ---------------- long-connection liveness ---------------- */
+
+static void ws_liveness_reset(void)
+{
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    s_ws_connected_ms = 0;
+    s_ws_last_ctrl_ms = 0;
+    s_ws_last_app_ms = 0;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+}
+
+static void ws_liveness_note_connected(int64_t now_ms)
+{
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    s_ws_connected_ms = now_ms;
+    s_ws_last_ctrl_ms = now_ms;
+    /* The application clock restarts with the session: keeping the previous
+     * session's stamp would make a brand new connection look stale before its
+     * first pong could arrive. */
+    s_ws_last_app_ms = 0;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+}
+
+/* Any frame at all: proves the TCP path carries bytes, nothing more. */
+static void ws_liveness_note_ctrl(int64_t now_ms)
+{
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    s_ws_last_ctrl_ms = now_ms;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+}
+
+/* An application-level frame: the answer to our application ping or a delivered
+ * event.  This is the only signal that says the *Feishu session* works. */
+static void ws_liveness_note_app(int64_t now_ms)
+{
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    s_ws_last_app_ms = now_ms;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+}
+
+/* Reference instant for application freshness.  Before the first application
+ * frame arrives, the CONNECTED instant is the evidence we have: a session that
+ * just came up gets one full window to prove itself instead of being declared
+ * stale immediately. */
+static int64_t ws_app_reference_ms(void)
+{
+    int64_t app, connected;
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    app = s_ws_last_app_ms;
+    connected = s_ws_connected_ms;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+    return app > connected ? app : connected;
+}
+
+/* Application pings go out every s_ping_interval seconds (the endpoint's
+ * ClientConfig PingInterval, 120 s by default) and the server answers each one,
+ * so an idle but healthy session still shows an application frame every interval
+ * plus latency.  Three intervals tolerate two lost pongs; the floor keeps a small
+ * server-advertised interval from making the test jittery, and the ceiling bounds
+ * it in case the endpoint ever advertises something absurd. */
+#define FEISHU_WS_APP_STALE_MAX_MS (10 * 60 * 1000)
+
+static int64_t ws_app_stale_limit_ms(void)
+{
+    int interval_s = s_ping_interval > 0 ? s_ping_interval : 120;
+    int64_t limit = (int64_t)interval_s * 3 * 1000;
+    if (limit < FEISHU_WS_RX_STALE_MS) limit = FEISHU_WS_RX_STALE_MS;
+    if (limit > FEISHU_WS_APP_STALE_MAX_MS) limit = FEISHU_WS_APP_STALE_MAX_MS;
+    return limit;
+}
+
+/* Count at most one reconnect per session: the four "session ended" events all
+ * arrive for the same dead socket. */
+static void ws_note_session_ended(uint32_t epoch)
+{
+    if (s_ws_counted_epoch == epoch) return;
+    s_ws_counted_epoch = epoch;
+    s_ws_reconnects++;
+}
+
 #define WS_EVENT_QUEUE_DEPTH 8
+/* One outbound slot per queued event plus room for control frames; both queues
+ * exist so that no caller ever blocks on the WebSocket task. */
+#define WS_TX_QUEUE_DEPTH WS_EVENT_QUEUE_DEPTH
 #define FEISHU_EVENT_TASK_STACK_BYTES 16384
 #define FEISHU_EVENT_STACK_WARN_BYTES 1536
-typedef struct { uint8_t *data; size_t len; uint32_t config_generation; } ws_job_t;
+/* The event id has to survive the queue so the dedup entry can be written after
+ * the event is handled; 80 matches feishu_event_dedup_t. */
+#define WS_EVENT_ID_MAX 80
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    uint32_t config_generation;
+    bool has_event_id;
+    char event_id[WS_EVENT_ID_MAX];
+} ws_job_t;
 typedef struct { uint8_t *data; int len; } ws_tx_t;
 static QueueHandle_t s_event_q;
 static QueueHandle_t s_tx_q;
@@ -104,6 +234,7 @@ static esp_err_t http_json(const char *url, const char *auth, const char *body,
 
     esp_err_t err = esp_http_client_open(c, (int)strlen(body));
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "http open failed: %s (%s)", esp_err_to_name(err), url);
         esp_http_client_cleanup(c);
         return err;
     }
@@ -113,6 +244,7 @@ static esp_err_t http_json(const char *url, const char *auth, const char *body,
         int chunk = body_remaining > 1024 ? 1024 : (int)body_remaining;
         int written = esp_http_client_write(c, body_cursor, chunk);
         if (written <= 0 || written > chunk) {
+            ESP_LOGW(TAG, "http write failed (%s)", url);
             esp_http_client_close(c);
             esp_http_client_cleanup(c);
             return ESP_FAIL;
@@ -122,12 +254,14 @@ static esp_err_t http_json(const char *url, const char *auth, const char *body,
     }
     int hdr_len = esp_http_client_fetch_headers(c);
     if (hdr_len < 0) {
+        ESP_LOGW(TAG, "http headers failed (%s)", url);
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
         return ESP_FAIL;
     }
     int status = esp_http_client_get_status_code(c);
     if (status_out) *status_out = status;
+    if (status < 200 || status >= 300) ESP_LOGW(TAG, "http status %d (%s)", status, url);
 
     char *buf = calloc(1, 8192);
     int total = 0;
@@ -149,12 +283,13 @@ static esp_err_t http_json(const char *url, const char *auth, const char *body,
 
 /* ---------------- token ---------------- */
 
-static esp_err_t token_refresh(void)
+static esp_err_t token_refresh_locked(const char *app_id, const char *app_secret)
 {
+    if (!app_id || !app_id[0] || !app_secret || !app_secret[0]) return ESP_ERR_INVALID_STATE;
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
-    cJSON_AddStringToObject(root, "app_id", s_cfg.app_id);
-    cJSON_AddStringToObject(root, "app_secret", s_cfg.app_secret);
+    cJSON_AddStringToObject(root, "app_id", app_id);
+    cJSON_AddStringToObject(root, "app_secret", app_secret);
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!body) return ESP_ERR_NO_MEM;
@@ -167,7 +302,10 @@ static esp_err_t token_refresh(void)
     esp_err_t err = http_json(url, NULL, body, &resp, &status);
     free(body);
     if (err != ESP_OK || !resp) {
+        ESP_LOGW(TAG, "token request failed: %s http=%d", esp_err_to_name(err), status);
         free(resp);
+        s_token[0] = '\0';
+        s_token_expire_ms = 0;
         return ESP_FAIL;
     }
 
@@ -182,27 +320,57 @@ static esp_err_t token_refresh(void)
     cJSON *code = cJSON_GetObjectItem(j, "code");
     cJSON *tok = cJSON_GetObjectItem(j, "tenant_access_token");
     cJSON *exp = cJSON_GetObjectItem(j, "expire");
-    if (code && code->valueint == 0 && tok && cJSON_IsString(tok)) {
+    cJSON *msg = cJSON_GetObjectItem(j, "msg");
+    long code_val = (code && cJSON_IsNumber(code)) ? (long)code->valueint : -1;
+    if (code_val == 0 && tok && cJSON_IsString(tok) && tok->valuestring[0]) {
         strlcpy(s_token, tok->valuestring, sizeof(s_token));
-        int expire = exp ? exp->valueint : 7200;
-        s_token_expire_ms = esp_timer_get_time() / 1000 + (int64_t)(expire - 300) * 1000;
+        int expire = (exp && cJSON_IsNumber(exp) && exp->valueint > 60) ? exp->valueint : 7200;
+        s_token_expire_ms = esp_timer_get_time() / 1000 + (int64_t)(expire - 60) * 1000;
         ret = ESP_OK;
         ESP_LOGI(TAG, "token ok, expire in %d s", expire);
     } else {
-        ESP_LOGE(TAG, "token request rejected (http=%d)", status);
+        /* Never keep a token the server refused: the next attempt must refresh. */
+        s_token[0] = '\0';
+        s_token_expire_ms = 0;
+        ESP_LOGE(TAG, "token rejected: http=%d code=%ld msg=%s", status, code_val,
+                 (msg && cJSON_IsString(msg)) ? msg->valuestring : "?");
     }
     cJSON_Delete(j);
     free(resp);
     return ret;
 }
 
-static const char *token_get(void)
+/* Copy the current tenant token into out, refreshing it when it is missing,
+ * expired, or when force is set.  Callers must NOT hold s_token_lock. */
+static bool token_get(char *out, size_t out_len, bool force, const char *app_id,
+                      const char *app_secret)
 {
-    if (s_token[0] && esp_timer_get_time() / 1000 < s_token_expire_ms) {
-        return s_token;
+    if (!out || out_len < 2) return false;
+    if (!s_token_lock) s_token_lock = xSemaphoreCreateMutex();
+    if (!s_token_lock) return false;
+    xSemaphoreTake(s_token_lock, portMAX_DELAY);
+    /* Snapshot first: feishu_init() bumps the epoch without taking this lock, so a
+     * configuration change that lands while the refresh below is in flight must be
+     * caught by re-reading it afterwards. */
+    uint32_t epoch = s_token_epoch;
+    bool ok = false;
+    if (!force && s_token[0] && s_token_fill_epoch == epoch &&
+        esp_timer_get_time() / 1000 < s_token_expire_ms) {
+        ok = true;
+    } else if (token_refresh_locked(app_id, app_secret) == ESP_OK) {
+        if (s_token_epoch == epoch) {
+            s_token_fill_epoch = epoch;
+            ok = true;
+        } else {
+            /* The credentials changed while the request was in flight: the token we
+             * just obtained belongs to the old ones, so leave the cache empty. */
+            s_token[0] = '\0';
+            s_token_expire_ms = 0;
+        }
     }
-    if (token_refresh() != ESP_OK) return NULL;
-    return s_token;
+    if (ok) strlcpy(out, s_token, out_len);
+    xSemaphoreGive(s_token_lock);
+    return ok;
 }
 
 /* ---------------- 发送 ---------------- */
@@ -212,82 +380,114 @@ static esp_err_t send_common(const char *url, const char *rid, const char *text,
                              char *msg_id, size_t msg_id_len, bool *retryable_out)
 {
     if (retryable_out) *retryable_out=false;
-    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (expected_generation != UINT32_MAX && expected_generation != s_cfg_generation) {
-        if (s_lock) xSemaphoreGive(s_lock);
+    if (!s_lock) return ESP_ERR_INVALID_STATE;
+
+    /* Snapshot the credentials and release the config lock before touching the
+     * network: holding it across a 10 s HTTP request stalled every other caller
+     * (including the long-connection setup) and made the status page report a
+     * healthy connection as offline for the whole retry cycle. */
+    char app_id[sizeof(s_cfg.app_id)], app_secret[sizeof(s_cfg.app_secret)];
+    uint32_t generation;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    strlcpy(app_id, s_cfg.app_id, sizeof(app_id));
+    strlcpy(app_secret, s_cfg.app_secret, sizeof(app_secret));
+    generation = s_cfg_generation;
+    xSemaphoreGive(s_lock);
+    if (expected_generation != UINT32_MAX && expected_generation != generation)
         return ESP_ERR_INVALID_STATE;
-    }
-    const char *tok = token_get();
-    if (!tok) { if (s_lock) xSemaphoreGive(s_lock); return ESP_FAIL; }
+    if (!app_id[0] || !app_secret[0]) return ESP_ERR_INVALID_STATE;
 
     cJSON *inner = cJSON_CreateObject();
-    if (!inner) { if (s_lock) xSemaphoreGive(s_lock); return ESP_ERR_NO_MEM; }
+    if (!inner) return ESP_ERR_NO_MEM;
     cJSON_AddStringToObject(inner, "text", text);
     char *inner_str = cJSON_PrintUnformatted(inner);
     cJSON_Delete(inner);
-    if (!inner_str) { if (s_lock) xSemaphoreGive(s_lock); return ESP_ERR_NO_MEM; }
+    if (!inner_str) return ESP_ERR_NO_MEM;
 
     cJSON *root = cJSON_CreateObject();
-    if (!root) { free(inner_str); if (s_lock) xSemaphoreGive(s_lock); return ESP_ERR_NO_MEM; }
-    if (rid && rid[0]) {
-        cJSON_AddStringToObject(root, "receive_id", rid);
-    }
+    if (!root) { free(inner_str); return ESP_ERR_NO_MEM; }
+    if (rid && rid[0]) cJSON_AddStringToObject(root, "receive_id", rid);
     cJSON_AddStringToObject(root, "msg_type", "text");
     cJSON_AddStringToObject(root, "content", inner_str);
     if (uuid && uuid[0]) cJSON_AddStringToObject(root, "uuid", uuid);
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     free(inner_str);
-    if (!body) { if (s_lock) xSemaphoreGive(s_lock); return ESP_ERR_NO_MEM; }
+    if (!body) return ESP_ERR_NO_MEM;
 
-    char *resp = NULL;
-    int status = 0;
-    esp_err_t err = http_json(url, tok, body, &resp, &status);
-    free(body);
-    if (err != ESP_OK) {
-        if (retryable_out && feishu_retry_policy(err!=ESP_ERR_NO_MEM,status))
-            *retryable_out=true;
-        free(resp);
-        if (s_lock) xSemaphoreGive(s_lock);
-        return err;
-    }
-
-    if (status>=500) {
-        if (retryable_out) *retryable_out=true;
-        free(resp);
-        if (s_lock) xSemaphoreGive(s_lock);
-        return ESP_FAIL;
-    }
-
-    if (status<200 || status>=300) {
-        free(resp);
-        if (s_lock) xSemaphoreGive(s_lock);
-        return ESP_FAIL;
-    }
-    cJSON *j = resp ? cJSON_Parse(resp) : NULL;
+    char tok[256];
     esp_err_t ret = ESP_FAIL;
-    if (j) {
-        cJSON *code = cJSON_GetObjectItem(j, "code");
-        if (code && cJSON_IsNumber(code) && code->valueint == 0) {
-            cJSON *data = cJSON_GetObjectItem(j, "data");
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!token_get(tok, sizeof(tok), attempt > 0, app_id, app_secret)) {
+            if (retryable_out) *retryable_out = true;
+            ret = ESP_FAIL;
+            break;
+        }
+        char *resp = NULL;
+        int status = 0;
+        esp_err_t err = http_json(url, tok, body, &resp, &status);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "send request failed: %s http=%d", esp_err_to_name(err), status);
+            if (retryable_out && feishu_retry_policy(err != ESP_ERR_NO_MEM, status))
+                *retryable_out = true;
+            free(resp);
+            ret = err;
+            break;
+        }
+        cJSON *j = resp ? cJSON_Parse(resp) : NULL;
+        cJSON *code = j ? cJSON_GetObjectItem(j, "code") : NULL;
+        long code_val = (code && cJSON_IsNumber(code)) ? (long)code->valueint : -1;
+        if (status >= 200 && status < 300 && code_val == 0) {
+            cJSON *data = j ? cJSON_GetObjectItem(j, "data") : NULL;
             cJSON *mid = data ? cJSON_GetObjectItem(data, "message_id") : NULL;
+            ret = ESP_FAIL;
             if (msg_id && msg_id_len) {
                 if (mid && cJSON_IsString(mid) && mid->valuestring[0] &&
-                    strlen(mid->valuestring)<msg_id_len) {
+                    strlen(mid->valuestring) < msg_id_len) {
                     strlcpy(msg_id, mid->valuestring, msg_id_len);
-                    ret=ESP_OK;
+                    ret = ESP_OK;
                 }
             } else {
-                ret=ESP_OK;
+                ret = ESP_OK;
             }
+            cJSON_Delete(j);
+            free(resp);
+            break;
+        }
+        /* The API reports most logical failures as HTTP 200 with a non-zero code. */
+        cJSON *msg = j ? cJSON_GetObjectItem(j, "msg") : NULL;
+        bool stale_token = feishu_should_retry_after_reject(attempt > 0, code_val, status);
+        const char *msg_str = (msg && cJSON_IsString(msg)) ? msg->valuestring : "?";
+        if (stale_token) {
+            ESP_LOGW(TAG, "send rejected (http=%d code=%ld msg=%s), refreshing token",
+                     status, code_val, msg_str);
         } else {
-            ESP_LOGE(TAG, "send failed http=%d", status);
+            ESP_LOGE(TAG, "send rejected (http=%d code=%ld msg=%s)", status, code_val, msg_str);
         }
         cJSON_Delete(j);
+        free(resp);
+        if (status >= 500) {
+            if (retryable_out) *retryable_out = true;
+            ret = ESP_FAIL;
+            break;
+        }
+        if (stale_token) continue;
+        ret = ESP_FAIL;
+        break;
     }
-    free(resp);
-    if (s_lock) xSemaphoreGive(s_lock);
+    if (ret == ESP_OK) {
+        __atomic_store_n(&s_send_fail_streak, 0, __ATOMIC_RELAXED);
+    } else if (__atomic_load_n(&s_send_fail_streak, __ATOMIC_RELAXED) < 1000) {
+        /* Saturate: the exact number is irrelevant once the channel counts as down. */
+        (void)__atomic_add_fetch(&s_send_fail_streak, 1, __ATOMIC_RELAXED);
+    }
+    free(body);
     return ret;
+}
+
+uint32_t feishu_send_fail_streak(void)
+{
+    return __atomic_load_n(&s_send_fail_streak, __ATOMIC_RELAXED);
 }
 
 esp_err_t feishu_send_text(const char *text, char *msg_id, size_t msg_id_len)
@@ -520,15 +720,14 @@ esp_err_t feishu_send_media_parts(const char *parent_id,
     if (!s_lock) return ESP_ERR_INVALID_STATE;
     if (count > FEISHU_MEDIA_PARTS_MAX) result->skipped_count = count - FEISHU_MEDIA_PARTS_MAX;
     char token[sizeof(s_token)];
+    char app_id[sizeof(s_cfg.app_id)], app_secret[sizeof(s_cfg.app_secret)];
     uint32_t generation;
     if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-    const char *current_token = token_get();
-    if (!current_token || strlcpy(token, current_token, sizeof(token)) >= sizeof(token)) {
-        xSemaphoreGive(s_lock);
-        return ESP_FAIL;
-    }
+    strlcpy(app_id, s_cfg.app_id, sizeof(app_id));
+    strlcpy(app_secret, s_cfg.app_secret, sizeof(app_secret));
     generation = s_cfg_generation;
     xSemaphoreGive(s_lock);
+    if (!token_get(token, sizeof(token), false, app_id, app_secret)) return ESP_FAIL;
 
     size_t bounded = count < FEISHU_MEDIA_PARTS_MAX ? count : FEISHU_MEDIA_PARTS_MAX;
     size_t total_bytes = 0;
@@ -630,12 +829,20 @@ esp_err_t feishu_send_media_parts(const char *parent_id,
 
 /* ---------------- 长连接 ---------------- */
 
+/* pbbp2_encode() writes the payload plus its envelope: every one of
+ * PBBP2_MAX_HEADERS header slots contributes a length varint and the key/value
+ * bytes, budgeted at 128 B each for the short keys and values we set, and the
+ * fixed fields plus the payload length varint fit in 1 KiB.  With the current 24
+ * header slots that is the historical 4 KiB scratch size. */
+#define WS_TX_HEADER_BUDGET_BYTES 128
+#define WS_TX_FRAME_OVERHEAD_BYTES (PBBP2_MAX_HEADERS * WS_TX_HEADER_BUDGET_BYTES + 1024)
+
 static bool ws_send_frame(pbbp2_frame_t *f)
 {
     if (!s_ws || !s_ws_connected || !s_tx_q || !f || f->payload_len > FEISHU_WS_MESSAGE_MAX) return false;
-    uint8_t *buf = malloc(4096 + f->payload_len);
+    uint8_t *buf = malloc(WS_TX_FRAME_OVERHEAD_BYTES + f->payload_len);
     if (!buf) return false;
-    int n = pbbp2_encode(f, buf, 4096 + f->payload_len);
+    int n = pbbp2_encode(f, buf, WS_TX_FRAME_OVERHEAD_BYTES + f->payload_len);
     if (n > 0) {
         ws_tx_t tx={.data=buf,.len=n};
         if (xQueueSend(s_tx_q,&tx,0)==pdTRUE) return true;
@@ -660,7 +867,9 @@ static bool ws_ack(pbbp2_frame_t *f, int code, int elapsed_ms)
 {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d", elapsed_ms);
-    pbbp2_header_set(f, "biz_rt", hdr);
+    /* Without biz_rt the gateway cannot measure the round trip, but the ack is
+     * still worth sending, so this is logged rather than aborting. */
+    if (pbbp2_header_set(f, "biz_rt", hdr) != 0) ESP_LOGW(TAG, "ack header set failed");
     char body[32];
     snprintf(body, sizeof(body), "{\"code\":%d}", code);
     free(f->payload);
@@ -682,7 +891,7 @@ static void handle_event_payload(const uint8_t *payload, size_t payload_len, uin
 
     cJSON *header = cJSON_GetObjectItem(j, "header");
     cJSON *etype = header ? cJSON_GetObjectItem(header, "event_type") : NULL;
-    ESP_LOGI(TAG, "event type=%s", (etype && cJSON_IsString(etype)) ? etype->valuestring : "?");
+    ESP_LOGD(TAG, "event type=%s", (etype && cJSON_IsString(etype)) ? etype->valuestring : "?");
     if (!etype || !cJSON_IsString(etype) ||
         strcmp(etype->valuestring, "im.message.receive_v1") != 0) {
         cJSON_Delete(j);
@@ -749,8 +958,23 @@ static void event_worker(void *arg)
     (void)arg;
     ws_job_t job;
     while (xQueueReceive(s_event_q, &job, portMAX_DELAY) == pdTRUE) {
-        if (job.config_generation == s_cfg_generation) {
+        if (job.config_generation != s_cfg_generation) {
+            /* The ack already went out when this job was queued, so nothing will
+             * ever redeliver the event; say which generation change ate it. */
+            ESP_LOGW(TAG, "dropping queued event: config generation %lu -> %lu",
+                     (unsigned long)job.config_generation, (unsigned long)s_cfg_generation);
+        } else if (job.has_event_id &&
+                   feishu_event_dedup_contains(&s_event_dedup, job.event_id)) {
+            /* The id is only remembered after handling, so two redeliveries of the
+             * same event can now be queued at once; the worker is the one place
+             * that closes that window. */
+            ESP_LOGW(TAG, "dropping duplicate queued event");
+        } else {
             handle_event_payload(job.data, job.len, job.config_generation);
+            /* Remembering the id here instead of at enqueue time is what makes a
+             * generation bump (or a crash) mid-queue replayable: the command was
+             * not executed, so it must not be filtered as seen. */
+            if (job.has_event_id) feishu_event_dedup_remember(&s_event_dedup, job.event_id);
         }
         free(job.data);
         /* ESP-IDF reports uxTaskGetStackHighWaterMark in bytes. */
@@ -758,9 +982,22 @@ static void event_worker(void *arg)
         if (low_water_bytes < FEISHU_EVENT_STACK_WARN_BYTES) {
             ESP_LOGW(TAG, "fs_event stack low-water: %u bytes", (unsigned)low_water_bytes);
         } else {
-            ESP_LOGI(TAG, "fs_event stack low-water: %u bytes", (unsigned)low_water_bytes);
+            ESP_LOGD(TAG, "fs_event stack low-water: %u bytes", (unsigned)low_water_bytes);
         }
     }
+}
+
+/* The server's answer to the application ping we send every s_ping_interval
+ * seconds.  The type arrives as the PBBP2 "type" header; payload_type is checked
+ * too because a gateway change could move it to the protobuf field of that name.
+ * Both spellings mean the same thing to us: the Feishu application layer is
+ * talking. */
+static bool ws_frame_is_app_pong(const pbbp2_frame_t *f)
+{
+    if (f->method != 0) return false;
+    const char *type = pbbp2_header_get(f, "type");
+    if (type && strcmp(type, "pong") == 0) return true;
+    return f->payload_type[0] && strcmp(f->payload_type, "pong") == 0;
 }
 
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -771,33 +1008,81 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     int64_t callback_start_ms = esp_timer_get_time() / 1000;
     esp_websocket_event_data_t *d = (esp_websocket_event_data_t *)data;
     switch (id) {
-    case WEBSOCKET_EVENT_CONNECTED:
+    case WEBSOCKET_EVENT_CONNECTED: {
+        /* Both stamps belong to this session: the transport clock starts now and
+         * the application clock waits for the first application-level frame. */
+        ws_liveness_note_connected(callback_start_ms);
         s_ws_online_epoch = handler_epoch;
         s_ws_connected = true;
-        ESP_LOGI(TAG, "ws connected");
+        s_ws_forced_dead = false;
+        /* A frame that was cut in half by the previous session can never be
+         * completed by this one; dropping the partial buffers here is what makes
+         * the reassemblers safe across reconnects (they otherwise self-reset only
+         * on the next offset mismatch, keeping a malloc'd buffer alive). */
+        feishu_ws_assembler_reset(&s_ws_assembler);
+        feishu_pbbp_assembler_reset(&s_pbbp_assembler);
+        ESP_LOGI(TAG, "ws connected, driver ping interval %u s",
+                 (unsigned)esp_websocket_client_get_ping_interval_sec(s_ws));
         break;
+    }
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_ws_connected = false;
-        s_ws_reconnects++;
+        ws_note_session_ended(handler_epoch);
         ESP_LOGW(TAG, "ws disconnected");
         break;
+    case WEBSOCKET_EVENT_ERROR:
+        if (d) {
+            ESP_LOGW(TAG, "ws error: type=%d tls=%d stack=%d sock_errno=%d handshake=%d",
+                     (int)d->error_handle.error_type, (int)d->error_handle.esp_tls_last_esp_err,
+                     (int)d->error_handle.esp_tls_stack_err,
+                     (int)d->error_handle.esp_transport_sock_errno,
+                     (int)d->error_handle.esp_ws_handshake_status_code);
+        }
+        /* fall through */
+    case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_FINISH:
+        /* A clean server-side CLOSE makes the library stop the client task
+         * without ever emitting DISCONNECTED, and abort_connection() skips the
+         * CLOSING state entirely.  Leaving s_ws_connected true here was the
+         * permanent outage: feishu_ws_start() then returned early forever and
+         * net_task never reconnected. */
+        s_ws_connected = false;
+        /* ERROR, DISCONNECTED, CLOSED and FINISH all describe this one dead
+         * session: the caller counts sessions, not events. */
+        ws_note_session_ended(handler_epoch);
+        ESP_LOGW(TAG, "ws session ended (event %d)", (int)id);
+        break;
     case WEBSOCKET_EVENT_DATA:
-        ESP_LOGI(TAG, "ws data op=%d len=%d", d->op_code, d->data_len);
+        /* Every frame refreshes the transport clock - including the driver's own
+         * RFC6455 PING/PONG exchange (op_code 0x0A, one every 10 s), which arrives
+         * here as a DATA event too.  That is exactly why it must not refresh the
+         * application clock: a wedged Feishu session keeps answering transport
+         * pings and would look healthy forever. */
+        ws_liveness_note_ctrl(callback_start_ms);
+        ESP_LOGD(TAG, "ws data op=%d off=%d len=%d total=%d", d->op_code, d->payload_offset,
+                 d->data_len, d->payload_len);
         if (d->op_code == 0x00 || d->op_code == 0x02 || d->op_code == 0x01) {
             uint8_t *wire=NULL; size_t wire_len=0;
+            /* The driver posts one DATA event per read chunk (at most .buffer_size,
+             * 8192 B) and only sets fin on the last chunk of the frame, so fin has
+             * to be derived from the offset or every multi-chunk frame is dropped
+             * unacked. */
+            bool frame_fin = (long)d->payload_offset + (long)d->data_len >= (long)d->payload_len;
             int assembled=feishu_ws_assembler_feed(&s_ws_assembler,(size_t)d->payload_offset,
-                    (size_t)d->payload_len,d->data_ptr,(size_t)d->data_len,d->fin,&wire,&wire_len);
+                    (size_t)d->payload_len,d->data_ptr,(size_t)d->data_len,frame_fin,&wire,&wire_len);
             if (assembled==1) {
                 pbbp2_frame_t f;
                 if (pbbp2_decode(wire,wire_len,&f)==0) {
                     if (f.method==0) {
-                        const char *type=pbbp2_header_get(&f,"type");
-                        if(type && strcmp(type,"pong")==0 && f.payload) {
-                            cJSON *cj=cJSON_Parse((const char *)f.payload);
-                            if(cj) {
-                                cJSON *pi=cJSON_GetObjectItem(cj,"PingInterval");
-                                if(pi && pi->valueint>0) s_ping_interval=pi->valueint;
-                                cJSON_Delete(cj);
+                        if (ws_frame_is_app_pong(&f)) {
+                            ws_liveness_note_app(callback_start_ms);
+                            if (f.payload) {
+                                cJSON *cj=cJSON_Parse((const char *)f.payload);
+                                if(cj) {
+                                    cJSON *pi=cJSON_GetObjectItem(cj,"PingInterval");
+                                    if(pi && pi->valueint>0) s_ping_interval=pi->valueint;
+                                    cJSON_Delete(cj);
+                                }
                             }
                         }
                     } else {
@@ -808,27 +1093,55 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                             const char *seq_h=pbbp2_header_get(&f,"seq");
                             int sum=sum_h?atoi(sum_h):1, seq=seq_h?atoi(seq_h):0;
                             uint8_t *payload=NULL; size_t payload_len=0;
-                            int ready=feishu_pbbp_assembler_feed(&s_pbbp_assembler,mid,sum,seq,
-                                f.payload,f.payload_len,esp_timer_get_time()/1000,&payload,&payload_len);
+                            int ready;
+                            if (sum <= 1) {
+                                /* Single-frame events: the protocol only requires a
+                                 * message_id when sum > 1, so handing these to the
+                                 * multi-part assembler dropped them unacked. */
+                                payload = malloc(f.payload_len ? f.payload_len : 1);
+                                if (payload) { memcpy(payload, f.payload, f.payload_len); payload_len = f.payload_len; ready = 1; }
+                                else ready = -1;
+                            } else {
+                                ready=feishu_pbbp_assembler_feed(&s_pbbp_assembler,mid,sum,seq,
+                                    f.payload,f.payload_len,esp_timer_get_time()/1000,&payload,&payload_len);
+                            }
                             if(ready==1) {
+                                /* The application layer delivered a complete event:
+                                 * this is the signal feishu_ws_alive() trusts, and
+                                 * it is independent of how the event is routed
+                                 * below (a queue-full drop still proves delivery). */
+                                ws_liveness_note_app(callback_start_ms);
                                 cJSON *ej=cJSON_ParseWithLength((const char *)payload,payload_len);
                                 cJSON *eh=ej?cJSON_GetObjectItem(ej,"header"):NULL;
                                 cJSON *eid=eh?cJSON_GetObjectItem(eh,"event_id"):NULL;
-                                bool has_id=eid&&cJSON_IsString(eid);
+                                bool has_id=eid&&cJSON_IsString(eid)&&eid->valuestring[0];
                                 bool duplicate=has_id&&feishu_event_dedup_contains(&s_event_dedup,eid->valuestring);
-                                ws_job_t job={.data=payload,.len=payload_len,.config_generation=handler_generation};
+                                ws_job_t job={.data=payload,.len=payload_len,
+                                              .config_generation=handler_generation,
+                                              .has_event_id=has_id};
+                                if(has_id) strlcpy(job.event_id,eid->valuestring,sizeof(job.event_id));
                                 if(duplicate) {
                                     free(payload);
+                                    ESP_LOGW(TAG, "duplicate event id, acking without running it");
                                     (void)ws_ack(&f,200,(int)(esp_timer_get_time()/1000-callback_start_ms));
                                 } else if(s_event_q && xQueueSend(s_event_q,&job,0)==pdTRUE) {
-                                    if(has_id) feishu_event_dedup_remember(&s_event_dedup,eid->valuestring);
+                                    /* The dedup entry is written by event_worker(),
+                                     * after the event was actually handled: an id
+                                     * remembered here survived a configuration
+                                     * change that made the worker drop the command. */
                                     (void)ws_ack(&f,200,(int)(esp_timer_get_time()/1000-callback_start_ms));
-                                } else free(payload);
+                                } else {
+                                    ESP_LOGW(TAG, "event queue full, dropping event unacked");
+                                    free(payload);
+                                }
                                 if(ej) cJSON_Delete(ej);
                             }
                         }
                     }
                     pbbp2_frame_free(&f);
+                } else {
+                    ESP_LOGW(TAG, "pbbp2 decode failed (%u B) on op_code %d",
+                             (unsigned)wire_len, (int)d->op_code);
                 }
                 free(wire);
             }
@@ -839,11 +1152,15 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
+/* Sends the application-level keepalive.  Liveness is *not* judged here: the
+ * supervisor (net_health.c) owns the staleness threshold and the repair ladder, so
+ * there is exactly one place that decides a session is dead. */
 static void ping_task(void *arg)
 {
     (void)arg;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(s_ping_interval * 1000));
+        int interval = s_ping_interval > 0 ? s_ping_interval : 120;
+        vTaskDelay(pdMS_TO_TICKS(interval * 1000));
         if (!s_ws_connected) continue;
         pbbp2_frame_t f;
         pbbp2_frame_init(&f);
@@ -861,7 +1178,8 @@ esp_err_t feishu_ws_start(void)
     if (!s_lock) s_lock=xSemaphoreCreateMutex();
     if (!s_ws_lock) s_ws_lock=xSemaphoreCreateMutex();
     if (!s_ws_lifecycle_lock) s_ws_lifecycle_lock=xSemaphoreCreateMutex();
-    if (!s_lock || !s_ws_lock || !s_ws_lifecycle_lock) return ESP_ERR_NO_MEM;
+    if (!s_token_lock) s_token_lock=xSemaphoreCreateMutex();
+    if (!s_lock || !s_ws_lock || !s_ws_lifecycle_lock || !s_token_lock) return ESP_ERR_NO_MEM;
     xSemaphoreTake(s_ws_lifecycle_lock,portMAX_DELAY);
     feishu_cfg_t cfg;
     uint32_t config_generation;
@@ -872,17 +1190,43 @@ esp_err_t feishu_ws_start(void)
     xSemaphoreGive(s_lock);
     if (!configured) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_ERR_INVALID_STATE; }
     int64_t now_ms=esp_timer_get_time()/1000;
-    if (s_ws && s_ws_connected) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_OK; }
-    if (s_ws && now_ms-s_ws_created_ms<20000) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_OK; }
-    if (!s_ws && now_ms<s_ws_retry_at_ms) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_ERR_INVALID_STATE; }
-    if (s_ws) {
+
+    /* Reuse a session that is either live or younger than WS_RECREATE_MIN_AGE_MS
+     * - a younger one may still be handshaking, so "not connected yet" is not
+     * evidence of anything.  The connected flag alone is not trusted either: a
+     * socket the gateway closed cleanly has already lost its task while our flag
+     * may still say connected, so ask the driver as well. */
+    bool session_present, session_usable = false, session_alive = false;
+    bool session_fresh = false;
+    int64_t retry_at_ms;
+    xSemaphoreTake(s_ws_lock,portMAX_DELAY);
+    session_present = s_ws != NULL;
+    if (session_present && !s_ws_forced_dead) {
+        session_usable = true;
+        session_fresh = now_ms - s_ws_created_ms < WS_RECREATE_MIN_AGE_MS;
+        session_alive = s_ws_connected && esp_websocket_client_is_connected(s_ws);
+    }
+    retry_at_ms = s_ws_retry_at_ms;
+    xSemaphoreGive(s_ws_lock);
+    if (session_usable && (session_fresh || session_alive)) {
+        xSemaphoreGive(s_ws_lifecycle_lock);
+        return ESP_OK;
+    }
+    if (!session_present && now_ms < retry_at_ms) {
+        xSemaphoreGive(s_ws_lifecycle_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (session_present) {
         ws_epoch_advance();
         xSemaphoreTake(s_ws_lock,portMAX_DELAY);
         esp_websocket_client_stop(s_ws);
         esp_websocket_client_destroy(s_ws);
         s_ws=NULL;
         s_ws_connected=false;
+        s_ws_forced_dead=false;
+        ws_liveness_reset();
         xSemaphoreGive(s_ws_lock);
+        ESP_LOGW(TAG, "dead long connection destroyed, refetching endpoint");
     }
     if (!s_event_q) {
         s_event_q = xQueueCreate(WS_EVENT_QUEUE_DEPTH, sizeof(ws_job_t));
@@ -895,29 +1239,34 @@ esp_err_t feishu_ws_start(void)
         }
     }
     if (!s_tx_q) {
-        s_tx_q = xQueueCreate(8, sizeof(ws_tx_t));
+        s_tx_q = xQueueCreate(WS_TX_QUEUE_DEPTH, sizeof(ws_tx_t));
         if (s_tx_q && xTaskCreate(ws_tx_task,"fs_tx",4096,NULL,5,&s_tx_task) != pdPASS) {
             vQueueDelete(s_tx_q); s_tx_q=NULL; s_tx_task=NULL;
         }
     }
     if (!s_event_q || !s_tx_q) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_ERR_NO_MEM; }
 
+    /* The endpoint request may take up to 10 s (and every retry repeats it), so
+     * it runs without the lifecycle lock: holding it here made every status
+     * query report the long connection as offline and blocked feishu_ws_stop(). */
+    xSemaphoreGive(s_ws_lifecycle_lock);
+
     cJSON *root = cJSON_CreateObject();
-    if (!root) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_ERR_NO_MEM; }
+    if (!root) return ESP_ERR_NO_MEM;
     cJSON_AddStringToObject(root, "AppID", cfg.app_id);
     cJSON_AddStringToObject(root, "AppSecret", cfg.app_secret);
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!body) { xSemaphoreGive(s_ws_lifecycle_lock); return ESP_ERR_NO_MEM; }
+    if (!body) return ESP_ERR_NO_MEM;
 
     char *resp = NULL;
     int status = 0;
     esp_err_t err = http_json(API_BASE WS_ENDPOINT_PATH, NULL, body, &resp, &status);
     free(body);
     if (err != ESP_OK || !resp) {
+        ESP_LOGW(TAG, "ws endpoint request failed: %s http=%d", esp_err_to_name(err), status);
         free(resp);
-        s_ws_retry_at_ms=esp_timer_get_time()/1000+10000;
-        xSemaphoreGive(s_ws_lifecycle_lock);
+        ws_retry_later(10000);
         return ESP_FAIL;
     }
 
@@ -929,76 +1278,137 @@ esp_err_t feishu_ws_start(void)
     if (status != 200 || !cJSON_IsNumber(code) || code->valuedouble != 0 ||
         !cJSON_IsString(url) || strncmp(url->valuestring, "wss://", 6) != 0 ||
         strlen(url->valuestring) >= sizeof(s_ws_url)) {
-        ESP_LOGE(TAG, "ws endpoint response invalid (http=%d)", status);
+        cJSON *msg = j ? cJSON_GetObjectItem(j, "msg") : NULL;
+        ESP_LOGE(TAG, "ws endpoint response invalid (http=%d code=%ld msg=%s)", status,
+                 (code && cJSON_IsNumber(code)) ? (long)code->valueint : -1L,
+                 (msg && cJSON_IsString(msg)) ? msg->valuestring : "?");
         if (j) cJSON_Delete(j);
         free(resp);
-        s_ws_retry_at_ms=esp_timer_get_time()/1000+10000;
-        xSemaphoreGive(s_ws_lifecycle_lock);
+        ws_retry_later(10000);
         return ESP_FAIL;
     }
-    strlcpy(s_ws_url, url->valuestring, sizeof(s_ws_url));
+    /* Parse into locals: this ran without the lifecycle lock, so writing the
+     * shared session globals here could interleave with a second caller. */
+    char url_local[sizeof(s_ws_url)];
+    char conn_local[sizeof(s_conn_id)];
+    int service_local = 0;
+    int ping_local = 0;
+    strlcpy(url_local, url->valuestring, sizeof(url_local));
+    conn_local[0] = 0;
     if (cc) {
         cJSON *pi = cJSON_GetObjectItem(cc, "PingInterval");
-        if (pi && pi->valueint > 0) s_ping_interval = pi->valueint;
+        if (pi && pi->valueint > 0) ping_local = pi->valueint;
     }
     cJSON_Delete(j);
     free(resp);
 
-    /* service_id / device_id 在 URL query 里 */
-    s_service_id = 0;
-    char *q = strstr(s_ws_url, "service_id=");
-    if (q) s_service_id = atoi(q + strlen("service_id="));
-    q = strstr(s_ws_url, "device_id=");
+    /* service_id / device_id live in the URL query. */
+    char *q = strstr(url_local, "service_id=");
+    if (q) service_local = atoi(q + strlen("service_id="));
+    q = strstr(url_local, "device_id=");
     if (q) {
-        char *e = strchr(q + strlen("device_id="), '&');
-        size_t n = e ? (size_t)(e - (q + strlen("device_id="))) : strlen(q + strlen("device_id="));
-        if (n < sizeof(s_conn_id)) {
-            memcpy(s_conn_id, q + strlen("device_id="), n);
-            s_conn_id[n] = 0;
+        const char *vp = q + strlen("device_id=");
+        char *e = strchr(vp, '&');
+        size_t n = e ? (size_t)(e - vp) : strlen(vp);
+        if (n < sizeof(conn_local)) {
+            memcpy(conn_local, vp, n);
+            conn_local[n] = 0;
         }
     }
-    ESP_LOGI(TAG, "ws url ready, service_id=%d", s_service_id);
 
-    esp_websocket_client_config_t wcfg = {
-        .uri = s_ws_url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size = 4096,
-        .reconnect_timeout_ms = 5000,
-        .network_timeout_ms = 10000,
-    };
-    esp_websocket_client_handle_t client=esp_websocket_client_init(&wcfg);
-    if (!client) {
-        s_ws_retry_at_ms=esp_timer_get_time()/1000+10000;
-        xSemaphoreGive(s_ws_lifecycle_lock);
-        return ESP_FAIL;
-    }
+    xSemaphoreTake(s_ws_lifecycle_lock,portMAX_DELAY);
     xSemaphoreTake(s_lock,portMAX_DELAY);
     bool generation_current=(config_generation==s_cfg_generation);
     xSemaphoreGive(s_lock);
     if(!generation_current) {
-        esp_websocket_client_destroy(client);
         xSemaphoreGive(s_ws_lifecycle_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    ws_epoch_advance();
+    /* Another caller may have installed a session while we fetched the endpoint.
+     * Anything that is not provably dead is treated as "someone else's session":
+     * overwriting it here used to leak an entire client (8 KB task + TLS context +
+     * socket) while its handshake was still in flight, and two clients then fought
+     * over one single-use endpoint.  Our freshly fetched URL is simply discarded;
+     * the other session is expected to come up on its own. */
+    xSemaphoreTake(s_ws_lock,portMAX_DELAY);
+    bool other_session = s_ws && !s_ws_forced_dead;
+    xSemaphoreGive(s_ws_lock);
+    if (other_session) {
+        ESP_LOGI(TAG, "ws session installed while fetching, keeping it");
+        xSemaphoreGive(s_ws_lifecycle_lock);
+        return ESP_OK;
+    }
+
+    esp_websocket_client_config_t wcfg = {
+        .uri = url_local,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size = 8192,
+        /* The event handler runs on this very task (no separate event task), so
+         * the stack has to cover TLS + cJSON + logging. */
+        .task_stack = 8192,
+        .task_name = "ws_client",
+        .network_timeout_ms = 10000,
+        .reconnect_timeout_ms = 5000,
+        /* Feishu hands out a single-use URL: the driver's own reconnect loop
+         * would keep retrying a URL the gateway already consumed and never
+         * recover.  net_task refetches the endpoint instead, like the official
+         * SDKs do. */
+        .disable_auto_reconnect = true,
+        .enable_close_reconnect = false,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 30,
+        .keep_alive_interval = 10,
+        .keep_alive_count = 3,
+    };
+    esp_websocket_client_handle_t client=esp_websocket_client_init(&wcfg);
+    if (!client) {
+        ws_retry_later(10000);
+        xSemaphoreGive(s_ws_lifecycle_lock);
+        return ESP_FAIL;
+    }
+    /* Publish the new session before the epoch moves.  The event handler drops
+     * every event whose epoch does not match s_ws_epoch, so a CONNECTED event that
+     * raced an epoch bump would be discarded and s_ws_connected would stay false
+     * for up to WS_RECREATE_MIN_AGE_MS (20 s) on a socket that is actually up.
+     * The handle becomes visible to other tasks only through s_ws_lock. */
+    xSemaphoreTake(s_ws_lock,portMAX_DELAY);
+    strlcpy(s_ws_url, url_local, sizeof(s_ws_url));
+    strlcpy(s_conn_id, conn_local, sizeof(s_conn_id));
+    s_service_id = service_local;
+    if (ping_local > 0) s_ping_interval = ping_local;
     s_ws_cfg_generation=config_generation;
     s_ws=client;
     s_ws_created_ms=esp_timer_get_time()/1000;
     s_ws_retry_at_ms=0;
+    s_ws_forced_dead=false;
+    s_ws_connected=false;
+    ws_liveness_reset();
+    ws_epoch_advance();
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler,
                                   (void *)(uintptr_t)s_ws_epoch);
-    err = esp_websocket_client_start(s_ws);
+    xSemaphoreGive(s_ws_lock);
+    err = esp_websocket_client_start(client);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ws client start failed: %s", esp_err_to_name(err));
         ws_epoch_advance();
         xSemaphoreTake(s_ws_lock,portMAX_DELAY);
-        esp_websocket_client_destroy(s_ws); s_ws=NULL; s_ws_connected=false;
-        xSemaphoreGive(s_ws_lock);
+        esp_websocket_client_destroy(s_ws);
+        s_ws=NULL;
+        s_ws_connected=false;
+        s_ws_forced_dead=false;
+        ws_liveness_reset();
         s_ws_retry_at_ms=esp_timer_get_time()/1000+10000;
+        xSemaphoreGive(s_ws_lock);
         xSemaphoreGive(s_ws_lifecycle_lock);
         return err;
     }
     if (!s_ping_task) {
-        xTaskCreate(ping_task, "ws_ping", 3072, NULL, 4, &s_ping_task);
+        if (xTaskCreate(ping_task, "ws_ping", 3072, NULL, 4, &s_ping_task) != pdPASS) {
+            /* Without this task nothing sends the application ping, so the session
+             * would look application-dead to every liveness consumer. */
+            ESP_LOGE(TAG, "ws_ping task creation failed, no application keepalive");
+            s_ping_task = NULL;
+        }
     }
     xSemaphoreGive(s_ws_lifecycle_lock);
     return ESP_OK;
@@ -1014,6 +1424,8 @@ static void ws_stop_locked(void)
         s_ws = NULL;
     }
     s_ws_connected = false;
+    s_ws_forced_dead = false;
+    ws_liveness_reset();
     if (s_ws_lock) xSemaphoreGive(s_ws_lock);
 }
 
@@ -1026,7 +1438,64 @@ void feishu_ws_stop(void)
     xSemaphoreGive(s_ws_lifecycle_lock);
 }
 
-bool feishu_ws_connected(void) { return s_ws_connected; }
+bool feishu_ws_connected(void) { return s_ws_connected && !s_ws_forced_dead; }
+
+int64_t feishu_ws_rx_age_ms(void)
+{
+    if (!s_ws_connected) return -1;
+    /* Application-level age, not transport age: the value the callers can act on
+     * is "how long has the Feishu session been silent", and the CONNECTED instant
+     * stands in for the first frame a fresh session has not delivered yet. */
+    int64_t last = ws_app_reference_ms();
+    if (last <= 0) return -1;
+    int64_t now = esp_timer_get_time() / 1000;
+    return now > last ? now - last : 0;
+}
+
+int64_t feishu_ws_connected_age_ms(void)
+{
+    int64_t since;
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    since = s_ws_connected_ms;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+    if (!s_ws_connected || since <= 0) return -1;
+    int64_t now = esp_timer_get_time() / 1000;
+    return now > since ? now - since : 0;
+}
+
+bool feishu_ws_alive(void)
+{
+    if (!feishu_ws_connected()) return false;
+    int64_t age = feishu_ws_rx_age_ms();
+    /* No measurement yet (CONNECTED not processed): do not invent a failure. */
+    if (age < 0) return true;
+    return age <= ws_app_stale_limit_ms();
+}
+
+bool feishu_ws_force_reconnect(void)
+{
+    if (!s_ws_connected) {
+        /* Callable without a live socket - the repair ladder may have spent a
+         * cooldown before noticing the session is already gone - but never silent:
+         * a no-op that looks like a successful repair is how a wedged session
+         * survives. */
+        ESP_LOGW(TAG, "force reconnect requested but no session is up");
+        return false;
+    }
+    s_ws_forced_dead = true;
+    /* Say *why* it looks dead: "nothing at all" is a transport problem, while
+     * "transport frames but no application frames" is the wedged Feishu session
+     * this whole freshness signal exists for. */
+    int64_t ctrl, app, now = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_ws_liveness_mux);
+    ctrl = s_ws_last_ctrl_ms;
+    app = s_ws_last_app_ms;
+    portEXIT_CRITICAL(&s_ws_liveness_mux);
+    ESP_LOGW(TAG, "long connection looks dead (last frame %lld ms ago, last application "
+                  "frame %lld ms ago), endpoint will be refetched",
+             (long long)(ctrl > 0 ? now - ctrl : -1), (long long)(app > 0 ? now - app : -1));
+    return true;
+}
 int feishu_ws_reconnects(void) { return s_ws_reconnects; }
 
 bool feishu_ws_authenticated_for(const char *app_id, const char *app_secret)
@@ -1088,8 +1557,9 @@ esp_err_t feishu_init(const feishu_cfg_t *cfg)
     if (!s_lock) s_lock = xSemaphoreCreateMutex();
     if (!s_ws_lock) s_ws_lock = xSemaphoreCreateMutex();
     if (!s_ws_lifecycle_lock) s_ws_lifecycle_lock=xSemaphoreCreateMutex();
+    if (!s_token_lock) s_token_lock=xSemaphoreCreateMutex();
     if (cfg) {
-        if(!s_lock || !s_ws_lock || !s_ws_lifecycle_lock) return ESP_ERR_NO_MEM;
+        if(!s_lock || !s_ws_lock || !s_ws_lifecycle_lock || !s_token_lock) return ESP_ERR_NO_MEM;
         xSemaphoreTake(s_ws_lifecycle_lock,portMAX_DELAY);
         xSemaphoreTake(s_lock, portMAX_DELAY);
         bool app_changed = s_cfg_initialized &&
@@ -1097,12 +1567,18 @@ esp_err_t feishu_init(const feishu_cfg_t *cfg)
                                                       s_cfg.app_secret, cfg->app_id, cfg->app_secret);
         s_cfg_generation++;
         s_cfg = *cfg;
-        s_token[0] = 0; s_token_expire_ms = 0;
+        /* Invalidate the cached token without taking s_token_lock: token_get() holds
+         * that lock across a 10 s HTTP refresh, so nesting it under s_lock here made
+         * saving the configuration in the web UI block net_task's reconnect for the
+         * whole request.  Bumping the epoch is enough - token_get() treats a token
+         * filled for an older epoch as absent. */
+        s_token_epoch++;
         if (app_changed) {
             s_cfg.open_id[0] = 0; s_cfg.chat_id[0] = 0;
         }
         s_cfg_initialized = true;
         xSemaphoreGive(s_lock);
+        /* Also clears the connected flag and the two liveness stamps. */
         ws_stop_locked();
         xSemaphoreGive(s_ws_lifecycle_lock);
         if (app_changed && s_peer_cb) s_peer_cb("", "");

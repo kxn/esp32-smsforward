@@ -81,17 +81,28 @@ const char *pbbp2_header_get(const pbbp2_frame_t *f, const char *key)
 
 int pbbp2_header_set(pbbp2_frame_t *f, const char *key, const char *value)
 {
+    /* A header without both halves is not encodable: pbbp2_encode() would call
+     * strlen(NULL) and the frame would be built from whatever followed it. */
+    if (!f || !key || !value) return -1;
     for (int i = 0; i < f->header_count; i++) {
         if (strcmp(f->headers[i].key, key) == 0) {
+            char *copy = strdup(value);
+            if (!copy) return -1;
             free(f->headers[i].value);
-            f->headers[i].value = strdup(value);
-            return f->headers[i].value ? 0 : -1;
+            f->headers[i].value = copy;
+            return 0;
         }
     }
     if (f->header_count >= PBBP2_MAX_HEADERS) return -1;
-    f->headers[f->header_count].key = strdup(key);
-    f->headers[f->header_count].value = strdup(value);
-    if (!f->headers[f->header_count].key || !f->headers[f->header_count].value) return -1;
+    char *k = strdup(key);
+    if (!k) return -1;
+    char *v = strdup(value);
+    if (!v) {
+        free(k);
+        return -1;
+    }
+    f->headers[f->header_count].key = k;
+    f->headers[f->header_count].value = v;
     f->header_count++;
     return 0;
 }
@@ -219,6 +230,11 @@ int pbbp2_decode(const uint8_t *buf, size_t len, pbbp2_frame_t *f)
                 snprintf(f->payload_type, sizeof(f->payload_type), "%.*s", (int)n, (const char *)d);
                 break;
             case 8:
+                /* A repeated payload field replaces the previous one; freeing it
+                 * first keeps a hostile or unusual frame from leaking memory. */
+                free(f->payload);
+                f->payload = NULL;
+                f->payload_len = 0;
                 f->payload = malloc((size_t)n + 1);
                 if (!f->payload) goto fail;
                 memcpy(f->payload, d, (size_t)n);

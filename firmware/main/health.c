@@ -85,7 +85,9 @@ static void health_task(void *arg)
         /* LED */
         static int tick;
         tick++;
-        bool fs_ok = feishu_ws_connected();
+        /* Solid only when the long connection is actually delivering: a session that
+         * is connected but silent is exactly what the field outage looked like. */
+        bool fs_ok = feishu_ws_connected() && feishu_ws_alive();
 
         gpio_set_level(PIN_LED1, fs_ok ? 1 : (tick % 4 < 2));
         if (s_blink_sms > 0) {
