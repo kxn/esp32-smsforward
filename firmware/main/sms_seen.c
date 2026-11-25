@@ -1,5 +1,9 @@
 #include "sms_seen.h"
 
+#include "esp_log.h"
+
+static const char *TAG = "sms_seen";
+
 #include <stddef.h>
 #include <errno.h>
 #include <stdio.h>
@@ -28,7 +32,11 @@ bool sms_seen_init(sms_seen_store_t *s, const char *path)
     memset(s, 0, sizeof(*s));
     strcpy(s->path, path);
     FILE *f = fopen(path, "rb");
-    if (!f) return errno == ENOENT;
+    if (!f) {
+        s->journal_ok = errno == ENOENT;
+        return s->journal_ok;
+    }
+    s->journal_ok = true; /* the file is readable; replay below tells the rest */
     bool have_newest = false;
     uint32_t newest = 0;
     for (unsigned i = 0; i < SMS_SEEN_CAP; ++i) {
@@ -73,11 +81,18 @@ bool sms_seen_commit(sms_seen_store_t *s, uint64_t hash)
     r.crc = record_crc(&r);
     FILE *f = fopen(s->path, "r+b");
     if (!f) f = fopen(s->path, "w+b");
-    if (!f) return false;
+    if (!f) {
+        s->journal_ok = false;
+        return false;
+    }
     bool ok = fseek(f, (long)((seq % SMS_SEEN_CAP) * sizeof(r)), SEEK_SET) == 0 &&
               fwrite(&r, sizeof(r), 1, f) == 1 && fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0) ok = false;
-    if (!ok) return false;
+    if (!ok) {
+        s->journal_ok = false;
+        return false;
+    }
+    s->journal_ok = true;
     s->hashes[s->next] = hash;
     if (s->count < SMS_SEEN_CAP) s->count++;
     s->next = (s->next + 1) % SMS_SEEN_CAP;
@@ -85,10 +100,33 @@ bool sms_seen_commit(sms_seen_store_t *s, uint64_t hash)
     return true;
 }
 
+sms_seen_state_t sms_seen_state(sms_seen_store_t *s, uint64_t hash)
+{
+    if (!s) return SMS_SEEN_UNKNOWN;
+    if (sms_seen_contains(s, hash)) return SMS_SEEN_ACKED;
+    return s->journal_ok ? SMS_SEEN_PENDING : SMS_SEEN_UNKNOWN;
+}
+
 bool sms_seen_deliver(sms_seen_store_t *s, uint64_t hash,
     sms_seen_stage_fn send_stage, sms_seen_stage_fn map_stage, void *context)
 {
-    if (!s || sms_seen_contains(s, hash)) return s && sms_seen_contains(s, hash);
-    if (!send_stage || !map_stage || !send_stage(context) || !map_stage(context)) return false;
-    return sms_seen_commit(s, hash);
+    /* A degraded journal (state UNKNOWN) still forwards: for a notification device,
+     * a possible duplicate is the lesser evil compared to a stall, and
+     * `status.sms.journal_ok` makes the condition visible. */
+    if (sms_seen_state(s, hash) == SMS_SEEN_ACKED) return true;
+    if (!send_stage) return false;
+    if (!send_stage(context)) return false;
+    /* Journal the success before the quote-reply bookkeeping.  Neither write may
+     * veto the delivery that already happened: the map is a convenience (it lets a
+     * reply reach the original thread) and the journal only dedups a retry of a
+     * SIM copy that should have been deleted.  Reporting failure here kept the SIM
+     * copy around and re-pushed the same message on every sweep, which is exactly
+     * the duplicate flood this journal was supposed to prevent. */
+    if (!sms_seen_commit(s, hash)) {
+        ESP_LOGW(TAG, "delivery journal write failed; the message stays delivered "
+                      "(possible duplicate only if power is lost before the SIM "
+                      "copy is deleted)");
+    }
+    if (map_stage) (void)map_stage(context);
+    return true;
 }

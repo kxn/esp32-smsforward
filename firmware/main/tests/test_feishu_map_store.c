@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void make_id(char *out, size_t len, int i)
@@ -58,9 +59,58 @@ int main(void)
     const char *absent[2]={"89860111111111111111","89860122222222222222"};
     if(sim_identity_match(iccid,absent,readable,&current_slot)!=SIM_IDENTITY_NO_MATCH) return 18;
 
+    /* Regression: a transient write failure must not latch for the rest of the
+     * boot. A missing directory makes every write fail while the store is
+     * otherwise healthy, and creating it later heals the same store instance. */
+    const char *blocked_path="map_blocked_dir/map.dat";
+    char blocked_sidecar[64];
+    (void)unlink(blocked_path);
+    if(!map_store_identity_path(blocked_path,blocked_sidecar,sizeof(blocked_sidecar))) return 22;
+    (void)unlink(blocked_sidecar);
+    (void)rmdir("map_blocked_dir");
+    if(!map_store_init(blocked_path)) return 23;
+    if(!map_store_healthy()) return 24;
+    for(int i=0;i<MAP_STORE_FAIL_LATCH;i++) {
+        make_id(id,sizeof(id),i);
+        if(map_store_note(id,0,"+8613800000000","sms_blocked")) return 25;
+    }
+    if(map_store_healthy()) return 26;
+
+    /* Short-circuited calls are rejected before any filesystem access. */
+    if(mkdir("map_blocked_dir",0700)!=0) return 27;
+    for(int i=0;i<MAP_STORE_RETRY_EVERY-1;i++) {
+        make_id(id,sizeof(id),100+i);
+        if(map_store_note(id,0,"+8613800000000","sms_blocked")) return 28;
+    }
+    if(access(blocked_path,F_OK)==0) return 29;
+    if(map_store_healthy()) return 30;
+
+    /* The MAP_STORE_RETRY_EVERY-th attempt after the latch is the probe, and a
+     * successful probe re-enables normal writes without a reinit. */
+    if(!map_store_note("msg_recovered",0,"+8613800000000","sms_recovered")) return 31;
+    if(!map_store_healthy()) return 32;
+    if(!map_store_lookup("msg_recovered",&slot,peer,sizeof(peer),record,sizeof(record)) ||
+       strcmp(record,"sms_recovered")) return 33;
+    if(!map_store_init(blocked_path)) return 34;
+    if(!map_store_lookup("msg_recovered",&slot,peer,sizeof(peer),record,sizeof(record)) ||
+       strcmp(record,"sms_recovered")) return 35;
+    if(!map_store_healthy()) return 36;
+
+    /* A single failure stays below the latch and recovers on the next write. */
+    (void)unlink(blocked_path);
+    (void)unlink(blocked_sidecar);
+    if(rmdir("map_blocked_dir")!=0) return 37;
+    if(map_store_note("msg_transient",0,"+8613800000000","sms_transient")) return 38;
+    if(!map_store_healthy()) return 39;
+    if(mkdir("map_blocked_dir",0700)!=0) return 40;
+    if(!map_store_note("msg_healed",0,"+8613800000000","sms_healed")) return 41;
+    if(!map_store_lookup("msg_healed",&slot,peer,sizeof(peer),record,sizeof(record)) ||
+       strcmp(record,"sms_healed")) return 42;
+
     if(!map_store_clear()) return 19;
+    (void)rmdir("map_blocked_dir");
     remove(path);
     remove(sidecar_path);
-    puts("PASS Feishu map wrap/reload, SIM identity binding, legacy invalidation, and safe slot matching");
+    puts("PASS Feishu map wrap/reload, SIM identity binding, legacy invalidation, safe slot matching, and write-fault recovery");
     return 0;
 }

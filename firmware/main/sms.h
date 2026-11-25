@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "modem.h"
 
@@ -21,3 +22,7 @@ int sms_read_index(modem_t *m, int idx);
 void sms_urc(modem_t *m, const char *line);
 /* 重试转发此前保留的短信（网络恢复后调用） */
 void sms_retry_pending(void);
+/* 当前空闲扫描间隔（毫秒），供状态页显示退避状态 */
+uint32_t sms_sweep_delay_ms(void);
+/* 去重日志最近一次读写是否正常；false 表示可能重复转发已发过的短信 */
+bool sms_journal_ok(void);

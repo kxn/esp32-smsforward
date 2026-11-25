@@ -14,6 +14,7 @@
 #include "feishu.h"
 #include "firmware_update.h"
 #include "net_health_policy.h"
+#include "sms_spool.h"
 #include "wifi.h"
 
 static const char *TAG = "net_health";
@@ -27,8 +28,9 @@ static const char *TAG = "net_health";
 #define PROBE_PERIOD_HEALTHY_MS (60 * 1000)
 #define PROBE_TIMEOUT_MS 3000
 /* esp_restart() does not wait for the UART: whatever is still buffered is lost.
- * The delay below exists to let the "restarting the device" line above drain,
- * because the owner reads that line to explain the sudden restart. */
+ * sms_spool_persist() below is synchronous (fsync + rename), so this delay only
+ * exists to let the "restarting the device" line above drain, because the owner
+ * reads that line to explain the sudden restart. */
 #define RESTART_LOG_DRAIN_MS 500
 
 /* Survives the software restart itself so an unattended device cannot end up in a
@@ -116,6 +118,10 @@ static void apply_action(net_action_t action)
         }
         ESP_LOGE(TAG, "upstream unreachable for too long, restarting the device");
         note_auto_restart();
+        /* Same rule as the console and RPC restart paths: events that only exist
+         * in RAM (call notices have no SIM copy) must survive the restart.  This
+         * call is synchronous, so the record is durable before esp_restart(). */
+        (void)sms_spool_persist();
         vTaskDelay(pdMS_TO_TICKS(RESTART_LOG_DRAIN_MS));
         esp_restart();
         break;

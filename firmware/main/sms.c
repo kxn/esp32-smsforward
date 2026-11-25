@@ -8,6 +8,7 @@
 #include "sms_seen.h"
 #include "sms_text.h"
 #include "sms_time_policy.h"
+#include "sms_spool.h"
 #include "cmd_policy.h"
 #include "modem_timing.h"
 #include "wap_mms.h"
@@ -120,6 +121,59 @@ static bool delivery_map_stage(void *context)
     return map_note_persisted(c->message_id, c->slot, c->peer, c->record_id);
 }
 
+/* The SIM sweep is the durable retry queue.  While the upstream is down it finds
+ * nothing to forward every time, so sweeping every 30 s only costs AT traffic and
+ * power; idle sweeps back off to 5 minutes and any successful forward resets it. */
+#define SMS_SWEEP_MIN_MS (30 * 1000)
+#define SMS_SWEEP_MAX_MS (5 * 60 * 1000)
+static uint32_t s_sweep_delay_ms = SMS_SWEEP_MIN_MS;
+static volatile unsigned s_forwarded_since_sweep;
+
+/* ---------------- 断网期间的待发送缓存 ---------------- */
+
+/* Parks one notification for later delivery.  The text was built once, at receipt
+ * time, so a replay after an outage still carries the original receive/ring time. */
+static void spool_park(uint8_t kind, int slot, time_t ts, bool ts_valid,
+                       uint64_t fingerprint, const char *peer, const char *record_id,
+                       const char *text)
+{
+    if (!sms_spool_park(kind, slot, (int64_t)ts, ts_valid, fingerprint, peer, record_id, text)) {
+        ESP_LOGE(TAG, "%s notification cannot be parked (queue full)",
+                 kind == SMS_SPOOL_KIND_CALL ? "call" : "sms");
+    }
+}
+
+/* Replay callback: runs on the spool task with the delivery lock held so it can
+ * never race the SIM sweep for the same message. */
+static bool spool_send_entry(const sms_spool_entry_t *e)
+{
+    if (!e) return false;
+    if (s_delivery_lock) xSemaphoreTake(s_delivery_lock, portMAX_DELAY);
+    bool ok = false;
+    if (e->kind == SMS_SPOOL_KIND_SMS && seen_contains(e->fingerprint)) {
+        /* The SIM sweep delivered it while we were parked. */
+        ok = true;
+        goto done;
+    }
+    if (!feishu_configured()) goto done;
+    {
+        char mid[64] = "";
+        esp_err_t err = feishu_send_text_uuid(e->text, e->record_id[0] ? e->record_id : NULL,
+                                              mid, sizeof(mid));
+        if (err != ESP_OK) goto done;
+        if (e->kind == SMS_SPOOL_KIND_SMS) {
+            /* Stop the retained SIM copy from being forwarded a second time. */
+            sms_seen_commit(&s_seen, e->fingerprint);
+        }
+        if (e->peer[0] && mid[0]) map_note_persisted(mid, e->slot, e->peer, e->record_id);
+        __atomic_add_fetch(&s_forwarded_since_sweep, 1, __ATOMIC_RELAXED);
+        ok = true;
+    }
+done:
+    if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
+    return ok;
+}
+
 typedef struct {
     int type;
     int slot;
@@ -173,7 +227,11 @@ static bool sim_identity_matches(modem_t *m, int idx, uint64_t expected)
 
 static void delete_sim_entry(modem_t *m, int idx, uint64_t expected)
 {
-    if (!m || idx <= 0 || !sim_identity_matches(m, idx, expected)) {
+    if (!m || idx <= 0) {
+        ESP_LOGW(TAG, "refusing to delete invalid SIM index %d", idx);
+        return;
+    }
+    if (!sim_identity_matches(m, idx, expected)) {
         ESP_LOGW(TAG, "SIM SMS %d changed before delete; retained", idx);
         return;
     }
@@ -183,7 +241,42 @@ static void delete_sim_entry(modem_t *m, int idx, uint64_t expected)
         ESP_LOGW(TAG, "could not delete delivered SIM SMS %d", idx);
 }
 
-static bool sim_identity_matches(modem_t *m, int index, uint64_t expected);
+/* After this many consecutive push failures the upstream is clearly down: park new
+ * events immediately instead of spending a 10 s HTTP timeout on each of them while
+ * the SIM card fills up.  The spool task still probes for recovery. */
+#define DELIVERY_STREAK_PARK 5
+
+
+static bool feishu_path_down(void)
+{
+    return feishu_send_fail_streak() >= DELIVERY_STREAK_PARK;
+}
+
+/* A full SIM card is how SMS were lost during the 30 h outage: the card was the
+ * only durable home and the network drops new messages once it is full.  The card
+ * entry of a parked notification is pure duplication, but only once the spool holds
+ * it in flash, so a nearly full card first forces one bulk persist.  The entries
+ * themselves are released by the normal index sweep (see sms_process_index), which
+ * already reads every index: no extra AT traffic, and progress is monotonic. */
+/* Called when the SIM card is about to fill up: the pending events must reach
+ * flash before their SIM copies may be released.  Persisting rewrites the whole
+ * ring, so while an outage keeps producing events this would otherwise rewrite
+ * megabytes on every sweep; the rate limit keeps the flash-wear cost bounded and
+ * the next sweep retries. */
+#define ENSURE_DURABLE_MIN_INTERVAL_MS (60 * 1000)
+
+static void ensure_pending_durable(void)
+{
+    static int64_t last_try_ms;
+    int64_t now = esp_timer_get_time() / 1000;
+    if (last_try_ms && now - last_try_ms < ENSURE_DURABLE_MIN_INTERVAL_MS) return;
+    if (sms_spool_pending() == 0) return;
+    if (sms_spool_all_saved()) return;
+    last_try_ms = now;
+    if (!sms_spool_persist()) {
+        ESP_LOGW(TAG, "the pending events are not durable yet; keeping the SIM copies");
+    }
+}
 
 static void *sms_alloc(size_t size)
 {
@@ -281,12 +374,6 @@ static bool deliver(modem_t *m, const char *peer, bool sender_is_phone,
              complete ? "complete" : "partial", got, total);
     health_sms_blink();
 
-    if (!feishu_configured()) {
-        ESP_LOGW(TAG, "Feishu unavailable; SIM SMS retained for retry");
-        if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
-        return false;
-    }
-
     size_t out_cap = SMS_ASSEMBLY_MAX_BYTES + 512;
     char *out = sms_alloc(out_cap);
     if (!out) {
@@ -305,19 +392,35 @@ static bool deliver(modem_t *m, const char *peer, bool sender_is_phone,
     }
     char record_id[24];
     snprintf(record_id, sizeof(record_id), "sms_%016" PRIx64, fingerprint);
+    if (!feishu_configured() || feishu_path_down()) {
+        /* Park it with its original timestamp; the SIM copy stays as the reboot
+         * safety net until the spool confirmed the delivery. */
+        spool_park(SMS_SPOOL_KIND_SMS, m->idx, display_ts, synced, fingerprint, peer,
+                   record_id, out);
+        ESP_LOGW(TAG, "Feishu unavailable; SMS parked, SIM copy retained");
+        free(out);
+        if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
+        return false;
+    }
     char mid[64] = "";
     sms_delivery_context_t ctx = { .text = out, .record_id = record_id, .slot = m->idx,
                                    .peer = peer, .message_id = mid,
                                    .message_id_size = sizeof(mid) };
     bool accepted = sms_seen_deliver(&s_seen, fingerprint, delivery_send_stage,
                                     delivery_map_stage, &ctx);
-    free(out);
     if (accepted) {
+        __atomic_add_fetch(&s_forwarded_since_sweep, 1, __ATOMIC_RELAXED);
         ESP_LOGI(TAG, "forwarded, msg_id=%s", mid);
+        free(out);
         if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
         return true;
     }
-    ESP_LOGW(TAG, "forward/map/journal failed; keep SIM copy for retry");
+    /* Parked as well so the retry keeps the arrival order and survives a restart
+     * even when the SIM card is full. */
+    spool_park(SMS_SPOOL_KIND_SMS, m->idx, display_ts, synced, fingerprint, peer,
+               record_id, out);
+    ESP_LOGW(TAG, "forward/map/journal failed; parked, SIM copy retained");
+    free(out);
     if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
     return false;
 }
@@ -498,8 +601,14 @@ static int sms_process_index(modem_t *m, int idx)
              deliver(m, d.sender, d.sender_is_phone, d.scts, d.text, true, 1, 1);
     }
 
+    uint64_t identity = deliver_identity(m->idx, &d);
     if (ok) {
-        delete_sim_entry(m, idx, deliver_identity(m->idx, &d));
+        delete_sim_entry(m, idx, identity);
+    } else if (sms_spool_holds_durably(identity)) {
+        /* Parked and saved: this card entry is a duplicate, and keeping it would
+         * fill the card and make the network drop new SMS. */
+        delete_sim_entry(m, idx, identity);
+        ESP_LOGW(TAG, "sms %d is safe in the spool; SIM slot released", idx);
     } else {
         ESP_LOGW(TAG, "keep sms %d for retry", idx);
     }
@@ -516,7 +625,11 @@ int sms_read_index(modem_t *m, int idx)
 /* ---------------- 鏉ョ數 ---------------- */
 
 static esp_timer_handle_t s_ring_timer[MODEM_COUNT];
-static volatile bool s_ring_active[MODEM_COUNT];
+/* Ring state is written by the modem URC task (RING/+CLIP) and consumed by
+ * ring_task, so every access goes through s_ring_mux; the AT work in ring_task
+ * happens outside the critical section. */
+static portMUX_TYPE s_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_ring_active[MODEM_COUNT];
 static char s_ring_peer[MODEM_COUNT][40];
 static uint64_t s_ring_start_ms[MODEM_COUNT];
 static time_t s_ring_start_epoch[MODEM_COUNT];
@@ -534,12 +647,25 @@ static void ring_task(void *arg)
     (void)arg;
     int slot;
     while (xQueueReceive(s_ring_q, &slot, portMAX_DELAY) == pdTRUE) {
-        if (slot < 0 || slot >= MODEM_COUNT || !s_ring_active[slot]) continue;
-        char peer[40];
+        if (slot < 0 || slot >= MODEM_COUNT) continue;
         static const char unknown[] = "\xE6\x9C\xAA\xE7\x9F\xA5";
-        strlcpy(peer, s_ring_peer[slot][0] ? s_ring_peer[slot] : unknown, sizeof(peer));
-        s_ring_peer[slot][0] = '\0';
-        s_ring_active[slot] = false;
+        char peer[40];
+        uint64_t start_ms;
+        time_t start_epoch;
+        bool time_ok;
+        bool active;
+        taskENTER_CRITICAL(&s_ring_mux);
+        active = s_ring_active[slot];
+        if (active) {
+            strlcpy(peer, s_ring_peer[slot][0] ? s_ring_peer[slot] : unknown, sizeof(peer));
+            s_ring_peer[slot][0] = '\0';
+            s_ring_active[slot] = false;
+            start_ms = s_ring_start_ms[slot];
+            start_epoch = s_ring_start_epoch[slot];
+            time_ok = s_ring_time_synced[slot];
+        }
+        taskEXIT_CRITICAL(&s_ring_mux);
+        if (!active) continue;
         if (!strcmp(peer, unknown)) {
             char resp[512] = {0};
             if (modem_cmd(&s_modems[slot], "AT+CLCC", resp, sizeof(resp), 400) == ESP_OK) {
@@ -563,23 +689,25 @@ static void ring_task(void *arg)
         if (!hung) hung = modem_cmd(&s_modems[slot], "AT+CHUP", NULL, 0, 800) == ESP_OK;
         if (hung) {
             ESP_LOGI(TAG, "call handled on slot %d after %llums", slot + 1,
-                     (unsigned long long)(esp_timer_get_time() / 1000 - s_ring_start_ms[slot]));
-            sms_job_t job = { .type = SMS_JOB_CALL, .slot = slot,
-                              .call_time = s_ring_start_epoch[slot],
-                              .call_mono_ms = s_ring_start_ms[slot],
-                              .call_time_synced = s_ring_time_synced[slot] };
-            strlcpy(job.peer, peer, sizeof(job.peer));
-            xQueueSend(s_sms_q, &job, 0);
+                     (unsigned long long)(esp_timer_get_time() / 1000 - start_ms));
         } else {
-            ESP_LOGW(TAG, "call hangup unconfirmed on slot %d", slot + 1);
+            /* Report it anyway: a missed call has no durable home, so refusing to
+             * notify because the hangup was not acknowledged loses a real event,
+             * while a redundant reject is harmless. */
+            ESP_LOGW(TAG, "call hangup unconfirmed on slot %d; reporting it anyway", slot + 1);
         }
+        sms_job_t job = { .type = SMS_JOB_CALL, .slot = slot,
+                          .call_time = start_epoch,
+                          .call_mono_ms = start_ms,
+                          .call_time_synced = time_ok };
+        strlcpy(job.peer, peer, sizeof(job.peer));
+        if (xQueueSend(s_sms_q, &job, 0) != pdTRUE) ESP_LOGW(TAG, "call queue full on slot %d", slot + 1);
     }
 }
 
 static void call_notice(int slot, const char *peer, time_t ring_time,
                         uint64_t ring_mono_ms, bool ring_time_synced)
 {
-    if (!feishu_configured()) return;
     uint64_t now_mono=(uint64_t)(esp_timer_get_time()/1000);
     uint64_t elapsed_s=now_mono>=ring_mono_ms?(now_mono-ring_mono_ms)/1000:0;
     bool synced=ring_time_synced || time_synced();
@@ -595,9 +723,23 @@ static void call_notice(int slot, const char *peer, time_t ring_time,
     int n=cmd_policy_format_call_notice(text,sizeof(text),slot,cmd_slot_name(slot),
                                         cmd_slot_number(slot),caller,ts,synced);
     if(n<0 || (size_t)n>=sizeof(text)) return;
+    /* A missed call has no durable home (unlike SMS, which the SIM card keeps), so
+     * an unreachable Feishu used to drop it for good.  Park it with its ring time
+     * and replay once the link is back. */
+    uint64_t fingerprint = sms_fingerprint(slot, caller, ts, text);
+    char record_id[24];
+    snprintf(record_id, sizeof(record_id), "call_%016" PRIx64, fingerprint);
+    if (!feishu_configured() || feishu_path_down()) {
+        spool_park(SMS_SPOOL_KIND_CALL, slot, ts, synced, fingerprint, peer, record_id, text);
+        return;
+    }
     char mid[64] = "";
-    if (feishu_send_text(text, mid, sizeof(mid)) == ESP_OK && valid_peer)
-        map_note(mid,slot,peer);
+    if (feishu_send_text(text, mid, sizeof(mid)) == ESP_OK) {
+        if (valid_peer) map_note(mid,slot,peer);
+        return;
+    }
+    spool_park(SMS_SPOOL_KIND_CALL, slot, ts, synced, fingerprint, peer, record_id, text);
+    ESP_LOGW(TAG, "call notice parked for replay");
 }
 
 void sms_urc(modem_t *m, const char *line)
@@ -617,14 +759,19 @@ void sms_urc(modem_t *m, const char *line)
 
     if (strncmp(line, "RING", 4) == 0) {
         int slot = m->idx;
-        if (slot >= 0 && slot < MODEM_COUNT && !s_ring_active[slot]) {
-            s_ring_active[slot] = true;
-            s_ring_start_ms[slot] = esp_timer_get_time() / 1000;
-            s_ring_start_epoch[slot] = time(NULL);
-            s_ring_time_synced[slot] = time_synced();
-            if (s_ring_timer[slot]) {
-                esp_timer_start_once(s_ring_timer[slot], 800000);
+        if (slot >= 0 && slot < MODEM_COUNT) {
+            bool started = false;
+            taskENTER_CRITICAL(&s_ring_mux);
+            if (!s_ring_active[slot]) {
+                s_ring_active[slot] = true;
+                s_ring_start_ms[slot] = esp_timer_get_time() / 1000;
+                s_ring_start_epoch[slot] = time(NULL);
+                s_ring_time_synced[slot] = time_synced();
+                started = true;
             }
+            taskEXIT_CRITICAL(&s_ring_mux);
+            /* esp_timer_start_once may allocate, so it stays outside the critical section. */
+            if (started && s_ring_timer[slot]) esp_timer_start_once(s_ring_timer[slot], 800000);
         }
         return;
     }
@@ -636,8 +783,10 @@ void sms_urc(modem_t *m, const char *line)
         if (slot >= 0 && slot < MODEM_COUNT && q1 && q2 &&
             (size_t)(q2 - q1 - 1) < sizeof(s_ring_peer[slot])) {
             size_t n = (size_t)(q2 - q1 - 1);
+            taskENTER_CRITICAL(&s_ring_mux);
             memcpy(s_ring_peer[slot], q1 + 1, n);
             s_ring_peer[slot][n] = '\0';
+            taskEXIT_CRITICAL(&s_ring_mux);
         }
         return;
     }
@@ -667,6 +816,9 @@ void sms_run(void)
                     int used, capacity;
                     if (p && sscanf(p, "+CPMS: \"%*[^\"]\",%d,%d", &used, &capacity) == 2 &&
                         used > 0 && used <= capacity && capacity <= 512) {
+                        /* Nearly full and holding unsaved events?  Make them durable
+                         * now so the sweep below may release their SIM copies. */
+                        if (used >= capacity - 1) ensure_pending_durable();
                         sms_job_t next = { .type = SMS_JOB_SCAN_STEP, .slot = job.slot,
                                            .idx = 1, .capacity = capacity, .remaining = used };
                         scanning[job.slot] = xQueueSend(s_sms_q, &next, 0) == pdTRUE;
@@ -701,6 +853,8 @@ void sms_run(void)
 
 void sms_retry_pending(void)
 {
+    /* Replay whatever the outage parked, in arrival order. */
+    sms_spool_notify();
     if (!s_modems || !s_sms_q || !feishu_configured()) return;
     for (int i = 0; i < MODEM_COUNT; i++) {
         sms_job_t job = { .type = SMS_JOB_SCAN_START, .slot = i };
@@ -712,10 +866,28 @@ static void sms_retry_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        /* SIM storage is the durable queue; retry even after transient network errors. */
+        vTaskDelay(pdMS_TO_TICKS(s_sweep_delay_ms));
+        /* SIM storage is the durable queue; retry even after transient network
+         * errors.  An idle sweep means the outage has not cleared yet. */
+        unsigned forwarded = __atomic_exchange_n(&s_forwarded_since_sweep, 0, __ATOMIC_RELAXED);
+        if (forwarded) {
+            s_sweep_delay_ms = SMS_SWEEP_MIN_MS;
+        } else if (s_sweep_delay_ms < SMS_SWEEP_MAX_MS) {
+            s_sweep_delay_ms *= 2;
+            if (s_sweep_delay_ms > SMS_SWEEP_MAX_MS) s_sweep_delay_ms = SMS_SWEEP_MAX_MS;
+        }
         sms_retry_pending();
     }
+}
+
+uint32_t sms_sweep_delay_ms(void)
+{
+    return s_sweep_delay_ms;
+}
+
+bool sms_journal_ok(void)
+{
+    return s_seen.journal_ok;
 }
 
 esp_err_t sms_modem_configure(int slot)
@@ -784,6 +956,7 @@ esp_err_t sms_init(modem_t *modems)
         return ESP_ERR_NO_MEM;
     sms_assembly_init(&s_concat);
     if (!sms_seen_init(&s_seen, "/data/sms_seen.dat")) return ESP_FAIL;
+    sms_spool_set_send_fn(spool_send_entry);
     if (xTaskCreate(ring_task, "ring", 12288, NULL, 9, NULL) != pdPASS ||
         xTaskCreate(concat_timer_task, "concat", 3072, NULL, 5, NULL) != pdPASS ||
         xTaskCreate(sms_retry_task, "sms_retry", 3072, NULL, 2, NULL) != pdPASS) {

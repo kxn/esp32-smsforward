@@ -20,6 +20,7 @@ CASES = {
     ROOT / "tools/test_ble_lifecycle.c": ["ble_lifecycle_policy.c"],
     ROOT / "tools/test_sms_assembly.c": ["sms_assembly.c"],
     ROOT / "tools/test_sms_seen.c": ["sms_seen.c"],
+    ROOT / "tools/test_sms_spool.c": ["sms_spool_core.c"],
     ROOT / "tools/test_net_health_policy.c": [],
     ROOT / "tools/test_feishu_auth_policy.c": [],
     ROOT / "tools/test_sms_text.c": ["sms_text.c"],
@@ -45,6 +46,7 @@ EXTRA_INCLUDES = {
     MAIN / "tests/test_feishu_media_policy.c": [ROOT / "tools/modem_fake"],
     ROOT / "tools/test_modem_transaction_flow.c": [ROOT / "tools/modem_fake"],
     ROOT / "tools/test_mms_fetch.c": [ROOT / "tools/modem_fake"],
+    ROOT / "tools/test_sms_seen.c": [ROOT / "tools/firmware_fake"],
 }
 
 

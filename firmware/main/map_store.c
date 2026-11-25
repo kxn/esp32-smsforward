@@ -43,18 +43,29 @@ typedef struct {
     uint32_t checksum;
 } map_identity_record_t;
 
+/* Write-failure streak. Flash/FAT writes can fail transiently (power glitch,
+ * busy volume), so a failure must not disable the store for the rest of the
+ * boot. After MAP_STORE_FAIL_LATCH consecutive failures the store stops
+ * touching the filesystem and only probes with one write every
+ * MAP_STORE_RETRY_EVERY attempted writes; a probe that succeeds clears the
+ * streak. This needs no clock and keeps the fast path allocation-free. */
+typedef struct {
+    unsigned fails;
+    unsigned skips;
+} write_gate_t;
+
 static map_entry_t s_map[MAP_STORE_CAPACITY] MAP_EXT_RAM;
 static map_disk_record_t s_disk[MAP_STORE_CAPACITY + 1] MAP_EXT_RAM;
 static char s_path[128];
 static char s_identity_path[128];
 static size_t s_head;
 static uint64_t s_seq;
-static bool s_write_fault;
+static write_gate_t s_write_gate;
 static map_identity_t s_identity[MAP_STORE_CAPACITY] MAP_EXT_RAM;
 static map_identity_record_t s_identity_disk[MAP_STORE_CAPACITY + 1] MAP_EXT_RAM;
 static size_t s_identity_head;
 static uint64_t s_identity_seq;
-static bool s_identity_write_fault;
+static write_gate_t s_identity_write_gate;
 
 static void copy_string(char *dst, size_t len, const char *src)
 {
@@ -116,15 +127,46 @@ static bool flush_record(FILE *fp, size_t slot, const map_disk_record_t *r)
     return fsync(fileno(fp))==0;
 }
 
+static bool gate_short_circuited(const write_gate_t *g)
+{
+    return g->fails>=MAP_STORE_FAIL_LATCH;
+}
+
+/* True when this call may touch the filesystem. While short-circuited only the
+ * one probe that lands on every MAP_STORE_RETRY_EVERY-th attempted write is
+ * let through, which bounds flash churn and retries a stale fault quickly. */
+static bool gate_allows_write(write_gate_t *g)
+{
+    if(!gate_short_circuited(g)) return true;
+    if(++g->skips<MAP_STORE_RETRY_EVERY) return false;
+    g->skips=0;
+    return true;
+}
+
+static void gate_note_result(write_gate_t *g, bool ok)
+{
+    g->skips=0;
+    if(ok) { g->fails=0; return; }
+    if(g->fails<MAP_STORE_FAIL_LATCH) ++g->fails;
+}
+
+/* Diagnostics: false while a write streak is short-circuiting new writes. A
+ * short-circuited store still serves lookups from memory and heals itself on
+ * the next successful probe. */
+bool map_store_healthy(void)
+{
+    return !gate_short_circuited(&s_write_gate) && !gate_short_circuited(&s_identity_write_gate);
+}
+
 bool map_store_init(const char *path)
 {
     if(!path || !path[0] || strlen(path)>=sizeof(s_path) ||
        !map_store_identity_path(path,s_identity_path,sizeof(s_identity_path))) return false;
     copy_string(s_path,sizeof(s_path),path);
     memset(s_map,0,sizeof(s_map)); memset(s_disk,0,sizeof(s_disk));
-    s_head=0; s_seq=0; s_write_fault=false;
+    s_head=0; s_seq=0; memset(&s_write_gate,0,sizeof(s_write_gate));
     memset(s_identity,0,sizeof(s_identity)); memset(s_identity_disk,0,sizeof(s_identity_disk));
-    s_identity_head=0; s_identity_seq=0; s_identity_write_fault=false;
+    s_identity_head=0; s_identity_seq=0; memset(&s_identity_write_gate,0,sizeof(s_identity_write_gate));
     FILE *fp=fopen(s_path,"rb");
     if(fp) {
         for(size_t i=0;i<MAP_STORE_CAPACITY+1;i++) {
@@ -171,10 +213,11 @@ bool map_store_init(const char *path)
 
 bool map_store_note(const char *msg_id, int slot, const char *peer, const char *record_id)
 {
-    if(!s_path[0] || s_write_fault || !msg_id || !msg_id[0] || slot<0 || slot>=2 || !peer || !peer[0]) return false;
+    if(!s_path[0] || !msg_id || !msg_id[0] || slot<0 || slot>=2 || !peer || !peer[0]) return false;
+    if(!gate_allows_write(&s_write_gate)) return false;
     FILE *fp=fopen(s_path,"r+b");
     if(!fp) fp=fopen(s_path,"w+b");
-    if(!fp) { s_write_fault=true; return false; }
+    if(!fp) { gate_note_result(&s_write_gate,false); return false; }
     size_t target=MAP_STORE_CAPACITY; uint64_t oldest=UINT64_MAX;
     for(size_t i=0;i<MAP_STORE_CAPACITY;i++) {
         if(memcmp(s_disk[i].magic,"MPR1",4)!=0) { target=i; break; }
@@ -191,7 +234,8 @@ bool map_store_note(const char *msg_id, int slot, const char *peer, const char *
             fflush(fp)==0 && fsync(fileno(fp))==0;
     if(ok) ok=flush_record(fp,target,&r);
     if(fclose(fp)!=0) ok=false;
-    if(!ok) { s_write_fault=true; return false; }
+    if(!ok) { gate_note_result(&s_write_gate,false); return false; }
+    gate_note_result(&s_write_gate,true);
     s_disk[MAP_STORE_CAPACITY]=r; s_disk[target]=r; s_seq=r.seq;
     s_map[s_head]=r.entry; s_head=(s_head+1)%MAP_STORE_CAPACITY;
     return true;
@@ -199,10 +243,11 @@ bool map_store_note(const char *msg_id, int slot, const char *peer, const char *
 
 static bool identity_note(const char *msg_id, const char *iccid)
 {
-    if(!s_identity_path[0] || s_identity_write_fault || !msg_id || !msg_id[0]) return false;
+    if(!s_identity_path[0] || !msg_id || !msg_id[0]) return false;
+    if(!gate_allows_write(&s_identity_write_gate)) return false;
     FILE *fp=fopen(s_identity_path,"r+b");
     if(!fp) fp=fopen(s_identity_path,"w+b");
-    if(!fp) { s_identity_write_fault=true; return false; }
+    if(!fp) { gate_note_result(&s_identity_write_gate,false); return false; }
     size_t target=MAP_STORE_CAPACITY; uint64_t oldest=UINT64_MAX;
     for(size_t i=0;i<MAP_STORE_CAPACITY;i++) {
         if(memcmp(s_identity_disk[i].magic,"MSI1",4)!=0) { target=i; break; }
@@ -222,7 +267,8 @@ static bool identity_note(const char *msg_id, const char *iccid)
            fflush(fp)==0 && fsync(fileno(fp))==0;
     }
     if(fclose(fp)!=0) ok=false;
-    if(!ok) { s_identity_write_fault=true; return false; }
+    if(!ok) { gate_note_result(&s_identity_write_gate,false); return false; }
+    gate_note_result(&s_identity_write_gate,true);
     s_identity_disk[MAP_STORE_CAPACITY]=r; s_identity_disk[target]=r; s_identity_seq=r.seq;
     s_identity[s_identity_head]=r.entry; s_identity_head=(s_identity_head+1)%MAP_STORE_CAPACITY;
     return true;
@@ -272,8 +318,8 @@ bool map_store_clear(void)
     if (s_identity_path[0] && unlink(s_identity_path) != 0 && errno != ENOENT) return false;
     memset(s_map, 0, sizeof(s_map));
     memset(s_disk, 0, sizeof(s_disk));
-    s_head = 0; s_seq = 0; s_write_fault = false;
+    s_head = 0; s_seq = 0; memset(&s_write_gate,0,sizeof(s_write_gate));
     memset(s_identity,0,sizeof(s_identity)); memset(s_identity_disk,0,sizeof(s_identity_disk));
-    s_identity_head=0; s_identity_seq=0; s_identity_write_fault=false;
+    s_identity_head=0; s_identity_seq=0; memset(&s_identity_write_gate,0,sizeof(s_identity_write_gate));
     return true;
 }

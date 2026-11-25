@@ -17,6 +17,7 @@
 #include "modem.h"
 #include "console.h"
 #include "sms.h"
+#include "sms_spool.h"
 #include "cmd.h"
 #include "feishu.h"
 #include "cmd_policy.h"
@@ -337,7 +338,10 @@ static void net_task(void *arg)
             ESP_LOGI(TAG, "Wi-Fi and authenticated Feishu websocket are online; closing BLE setup");
             ble_lockdown();
         }
-        if (online && !was_online) sms_retry_pending();
+        if (online && !was_online) {
+            sms_retry_pending();
+            sms_spool_notify();
+        }
         was_online = online;
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000))) {
             fs_retry_at = 0;
@@ -400,6 +404,9 @@ void app_main(void)
     }
     esp_err_t storage_err = storage_mount();
     if (storage_err != ESP_OK) ESP_LOGE(TAG, "storage unavailable: %s", esp_err_to_name(storage_err));
+    /* Pending events (SMS/call notices the outage could not forward) are restored
+     * before any traffic, so a restart does not lose them. */
+    if (sms_spool_start() != ESP_OK) ESP_LOGE(TAG, "pending-event spool unavailable");
 
     const app_cfg_t *cfg = cfg_get();
     feishu_cfg_t fcfg = {0};

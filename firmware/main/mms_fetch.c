@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -621,7 +622,10 @@ esp_err_t mms_fetch(modem_t *m, const char *url, uint8_t **body, size_t *len)
     }
 
     const size_t wire_cap = MMS_BODY_MAX + MMS_HTTP_OVERHEAD_MAX;
-    wire = (uint8_t *)malloc(wire_cap);
+    /* A 2 MiB body does not belong in the internal heap, which also has to hold the
+     * TLS/HTTP state of the Feishu side; prefer PSRAM and keep malloc as fallback. */
+    wire = (uint8_t *)heap_caps_malloc(wire_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wire) wire = (uint8_t *)malloc(wire_cap);
     if (!wire) { result = ESP_ERR_NO_MEM; goto cleanup; }
     int64_t total_deadline = esp_timer_get_time() + (int64_t)MMS_TOTAL_TIMEOUT_MS * 1000;
     int64_t next_home_poll = esp_timer_get_time() + (int64_t)MMS_HOME_POLL_MS * 1000;

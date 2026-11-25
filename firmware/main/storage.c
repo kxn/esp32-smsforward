@@ -38,7 +38,7 @@ esp_err_t storage_mount(void)
         .max_files = 16,
         .allocation_unit_size = 4096,
     };
-    e = esp_vfs_fat_spiflash_mount_rw_wl("/data", "storage", &cfg, &s_wl);
+    e = esp_vfs_fat_spiflash_mount_rw_wl(STORAGE_MOUNT_POINT, STORAGE_PARTITION_LABEL, &cfg, &s_wl);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "FAT mount failed (%s); filesystem left untouched", esp_err_to_name(e));
         return e;
