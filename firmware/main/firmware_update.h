@@ -30,6 +30,10 @@ bool firmware_can_upload(void);
 firmware_result_t firmware_upload(size_t content_len, firmware_read_fn read,
                                   void *ctx, char version[FIRMWARE_VERSION_SIZE]);
 
+/* True while an upload or a reserved restart is in flight; used by the health
+ * supervisor so an automatic restart never interrupts an upgrade. */
+bool firmware_busy(void);
+
 bool firmware_restart_reserve(void);
 void firmware_restart_release(void);
 void firmware_boot_check_start(bool (*lan_healthy)(void));

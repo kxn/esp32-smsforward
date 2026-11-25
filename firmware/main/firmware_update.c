@@ -41,6 +41,11 @@ static bool claim(int operation)
     return atomic_compare_exchange_strong(&s_operation, &idle, operation);
 }
 
+bool firmware_busy(void)
+{
+    return atomic_load(&s_operation) != FIRMWARE_IDLE;
+}
+
 bool firmware_restart_reserve(void)
 {
     return claim(FIRMWARE_RESTARTING);

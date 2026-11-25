@@ -18,3 +18,14 @@ esp_err_t wifi_scan(char *json, size_t json_len);
 
 esp_err_t sntp_start(void);
 bool time_synced(void);
+
+/* Recovery primitives used by the connection supervisor.  All of them are
+ * best-effort and safe to call while the device is running. */
+esp_err_t time_sync_restart(void);
+esp_err_t wifi_dhcp_renew(void);
+esp_err_t wifi_reassociate(void);
+
+/* Probe whether the internet (not just the AP link) is reachable: resolves
+ * open.feishu.cn and opens a TCP connection to its 443 port.  Either output may
+ * be NULL.  Returns true only when both steps succeeded. */
+bool wifi_probe_internet(bool *dns_ok, bool *tcp_ok, int timeout_ms);

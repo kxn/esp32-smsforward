@@ -27,6 +27,7 @@
 #include "lan_web.h"
 #include "rpc.h"
 #include "health.h"
+#include "net_health.h"
 #include "nvs_flash.h"
 #include "device_status.h"
 #include "storage.h"
@@ -460,6 +461,7 @@ void app_main(void)
         xTaskCreate(slot_status_task, "slot_status", 4096, NULL, 3, NULL);
         xTaskCreate(net_task, "net", 6144, NULL, 4, &s_net_task);
         health_start(s_modems);
+        net_health_start();
     }
     ble_start();
     if (storage_err == ESP_OK && rpc_err == ESP_OK && !s_safe_mode)

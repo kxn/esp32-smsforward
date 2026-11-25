@@ -1,7 +1,10 @@
 #include "wifi.h"
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -13,6 +16,8 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "lwip/inet.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
 
 static const char *TAG = "wifi";
 
@@ -30,11 +35,28 @@ static int s_rssi;
 static int64_t s_up_since;
 static esp_timer_handle_t s_retry_timer;
 static uint32_t s_retry_delay_ms = 1000;
+static int64_t s_last_sync_ms;
 
 #define WIFI_RETRY_INITIAL_MS 1000
 #define WIFI_RETRY_MAX_MS 30000
 
-static void retry_connect(void *arg) { (void)arg; esp_wifi_connect(); }
+static void retry_connect(void *arg)
+{
+    (void)arg;
+    esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK) return;
+    /* The driver refused to start a new attempt (busy, stopping, or the AP is
+     * still blacklisted).  No further DISCONNECTED event will arrive, so the
+     * timer has to be re-armed here or the station stays offline until reboot. */
+    uint32_t delay_ms = s_retry_delay_ms;
+    s_retry_delay_ms = s_retry_delay_ms < WIFI_RETRY_MAX_MS ? s_retry_delay_ms * 2 : WIFI_RETRY_MAX_MS;
+    ESP_LOGW(TAG, "connect failed (%s), retry in %lu ms", esp_err_to_name(err),
+             (unsigned long)delay_ms);
+    if (s_retry_timer) {
+        esp_timer_stop(s_retry_timer);
+        esp_timer_start_once(s_retry_timer, (uint64_t)delay_ms * 1000);
+    }
+}
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -60,6 +82,13 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
             xEventGroupClearBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
             s_ip[0] = '\0';
         }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        /* Lease renewal failed or the DHCP client was stopped: the address is
+         * gone even though the association may still exist.  Without this the
+         * GOT_IP bit stays latched and nothing ever resets the upper layers. */
+        xEventGroupClearBits(s_events, BIT_GOT_IP);
+        s_ip[0] = '\0';
+        ESP_LOGW(TAG, "address lost");
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
@@ -85,6 +114,7 @@ static void netif_init_once(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, event_handler, NULL));
     s_events = xEventGroupCreate();
     s_config_lock = xSemaphoreCreateMutex();
     s_inited = true;
@@ -263,6 +293,7 @@ void wifi_status(char *ssid, size_t ssid_len, char *ip, size_t ip_len, int *rssi
 static void time_cb(struct timeval *tv)
 {
     s_time_synced = true;
+    s_last_sync_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "sntp synced: %lld", (long long)tv->tv_sec);
 }
 
@@ -280,6 +311,107 @@ esp_err_t sntp_start(void)
 bool time_synced(void)
 {
     return s_time_synced;
+}
+
+esp_err_t time_sync_restart(void)
+{
+    /* The clock can drift or a previous poll can be lost; every TLS handshake
+     * needs a plausible wall clock, so a stale one is worth re-syncing. */
+    ESP_LOGW(TAG, "restarting sntp client");
+    esp_sntp_stop();
+    s_time_synced = false;
+    return sntp_start();
+}
+
+esp_err_t wifi_dhcp_renew(void)
+{
+    if (!s_config_lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_config_lock, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif && s_started) {
+        esp_netif_dhcpc_stop(netif);
+        err = esp_netif_dhcpc_start(netif);
+        if (err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) err = ESP_OK;
+        ESP_LOGW(TAG, "renewing dhcp lease (%s)", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_config_lock);
+    return err;
+}
+
+esp_err_t wifi_reassociate(void)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    ESP_LOGW(TAG, "re-associating with the access point");
+    esp_err_t err = esp_wifi_disconnect();
+    if (err == ESP_ERR_WIFI_NOT_CONNECT) {
+        /* Already unassociated: the retry timer is not armed by a disconnect that
+         * never happened, so kick a connect attempt off directly. */
+        err = esp_wifi_connect();
+        if (err == ESP_OK) {
+            xEventGroupClearBits(s_events, BIT_GOT_IP);
+            s_ip[0] = '\0';
+        }
+        return err;
+    }
+    if (err != ESP_OK) {
+        /* Tear-down refused; a plain reconnect attempt is still better than
+         * leaving the link exactly as broken as it was. */
+        (void)esp_wifi_connect();
+        return err;
+    }
+    /* The disconnect handler clears the bits and re-arms the retry timer. */
+    xEventGroupClearBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
+    s_ip[0] = '\0';
+    return ESP_OK;
+}
+
+static bool tcp_probe(const struct sockaddr *addr, socklen_t addr_len, int timeout_ms)
+{
+    int fd = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    bool ok = false;
+    if (connect(fd, addr, addr_len) == 0) {
+        ok = true;
+    } else if (errno == EINPROGRESS || errno == EALREADY) {
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(fd, &writable);
+        struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
+        if (select(fd + 1, NULL, &writable, NULL, &tv) > 0) {
+            int so_err = 0;
+            socklen_t so_len = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) == 0 && so_err == 0) ok = true;
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+bool wifi_probe_internet(bool *dns_ok, bool *tcp_ok, int timeout_ms)
+{
+    if (dns_ok) *dns_ok = false;
+    if (tcp_ok) *tcp_ok = false;
+    if (!wifi_connected()) return false;
+    if (timeout_ms <= 0) timeout_ms = 3000;
+
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo("open.feishu.cn", "443", &hints, &res);
+    if (rc != 0 || !res) {
+        ESP_LOGW(TAG, "probe: dns lookup failed (%d)", rc);
+        return false;
+    }
+    if (dns_ok) *dns_ok = true;
+    bool tcp = tcp_probe(res->ai_addr, res->ai_addrlen, timeout_ms);
+    freeaddrinfo(res);
+    if (tcp_ok) *tcp_ok = tcp;
+    if (!tcp) ESP_LOGW(TAG, "probe: tcp/443 unreachable");
+    return tcp;
 }
 
 esp_err_t wifi_scan(char *json, size_t json_len)
