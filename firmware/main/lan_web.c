@@ -14,11 +14,13 @@
 
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "mbedtls/sha256.h"
 
 static const char *TAG = "lan_web";
 static httpd_handle_t s_server;
@@ -248,15 +250,37 @@ static esp_err_t firmware_post(httpd_req_t *req)
     return sent;
 }
 
-static bool create_token_locked(void)
+/* Management token.
+ *
+ * It used to be 16 random bytes regenerated on every boot, so any restart (or a
+ * firmware update, which restarts the device) made the owner ask the device for a
+ * new link before the web console could be opened again -- impossible when the
+ * console is exactly what is unreachable.  Deriving it from the factory MAC keeps
+ * it identical across reboots, OTA updates and factory resets, costs no flash
+ * write and is unique per device.  The link travels over plain HTTP inside the
+ * LAN, so the token is there to keep other LAN hosts and CSRF out, not to be a
+ * long-term secret. */
+static const char TOKEN_SALT[] = "esp32-smsforward lan web token v1";
+
+static bool derive_token_locked(void)
 {
     if (s_token[0]) return true;
-    uint8_t raw[16];
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return false;
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    int rc = mbedtls_sha256_starts(&ctx, 0);
+    if (rc == 0) rc = mbedtls_sha256_update(&ctx, (const unsigned char *)TOKEN_SALT,
+                                            sizeof(TOKEN_SALT) - 1);
+    if (rc == 0) rc = mbedtls_sha256_update(&ctx, mac, sizeof(mac));
+    if (rc == 0) rc = mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+    if (rc != 0) return false;
     static const char hex[] = "0123456789abcdef";
-    esp_fill_random(raw, sizeof(raw));
-    for (size_t i = 0; i < sizeof(raw); ++i) {
-        s_token[i * 2] = hex[raw[i] >> 4];
-        s_token[i * 2 + 1] = hex[raw[i] & 0x0f];
+    for (size_t i = 0; i < 16; ++i) {
+        s_token[i * 2] = hex[digest[i] >> 4];
+        s_token[i * 2 + 1] = hex[digest[i] & 0x0f];
     }
     s_token[32] = '\0';
     return true;
@@ -273,6 +297,13 @@ esp_err_t lan_web_start(void)
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool already_started = s_server != NULL;
+    /* Derive it now rather than on the first /web request, so a link saved from a
+     * previous boot still authorises the very first RPC after a restart. */
+    if (!already_started && !derive_token_locked()) {
+        xSemaphoreGive(s_lock);
+        ESP_LOGE(TAG, "cannot derive the management token");
+        return ESP_FAIL;
+    }
     xSemaphoreGive(s_lock);
     if (already_started) return ESP_OK;
 
@@ -351,7 +382,7 @@ bool lan_web_management_url(char *out, size_t cap)
         xSemaphoreGive(s_lock);
         return false;
     }
-    bool token_ok = create_token_locked();
+    bool token_ok = derive_token_locked();
     int n = token_ok ? snprintf(out, cap, "http://%s/#token=%s", ip, s_token) : -1;
     xSemaphoreGive(s_lock);
     if (n < 0 || (size_t)n >= cap) {

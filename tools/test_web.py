@@ -173,6 +173,17 @@ class LanHandler(Handler):
             self._json(200, {"id": request.get("id"), "ok": True})
             return
         self.server.status_count += 1
+        extra = {}
+        if not self.server.hide_diagnostics:
+            extra["net"] = {"internet_ok": False, "dns_ok": True, "tcp_ok": False, "down_ms": 660000,
+                            "outages": 1, "last_action": 2, "auto_restarted": False}
+            # `pending` missing means the backlog store failed to start; the page must
+            # say so instead of hiding the card.
+            extra["spool"] = ({"added": 0, "dropped": 0, "durable": False, "persist_failed": False}
+                              if self.server.spool_broken else
+                              {"pending": 3, "pending_calls": 1, "added": 3, "dropped": 0,
+                               "durable": True, "persist_failed": False})
+            extra["sms"] = {"journal_ok": not self.server.journal_broken, "sweep_ms": 30000}
         self._json(200, {"id": request.get("id"), "ok": True, "data": {
             "slots": [
                 {"n": 1, "name": "LAN 主卡", "num": "13800138000", "reg": True, "op": "运营商", "csq": 20},
@@ -181,6 +192,7 @@ class LanHandler(Handler):
             "wifi": {"ssid": "Studio", "cfg_ssid": "Studio", "ip": "192.168.1.40", "cfg_ip": "192.168.1.40", "dhcp": True},
             "feishu": {"state": "online", "configured": True, "app_id": "cli_test"},
             "time": {"synced": True, "utc": 1763900000, "tz": 8},
+            **extra,
             **({"firmware": self.server.firmware_status} if self.server.firmware_status is not None else {}),
         }})
 
@@ -199,6 +211,9 @@ def start_lan_server(token):
     server.expected_token = token
     server.auth_headers = []
     server.telemetry_count = 0
+    server.hide_diagnostics = False
+    server.spool_broken = False
+    server.journal_broken = False
     server.factory_requests = []
     server.firmware_requests = []
     server.firmware_release = threading.Event()
@@ -266,6 +281,40 @@ def test_lan_mode(browser) -> None:
             raise AssertionError("management token remained after reload")
         if first.auth_headers[-1] != "Bearer " + token:
             raise AssertionError("LAN reload did not reuse same-tab credential")
+
+        # The uplink and the offline backlog used to be invisible while every other
+        # card looked healthy.
+        grid = page.locator("#networkGrid")
+        page.get_by_role("button", name="设备概览", exact=True).click()
+        page.evaluate("refresh()")
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('待补发')")
+        page.get_by_text("上行网络", exact=True).wait_for()
+        page.get_by_text("不可达", exact=True).wait_for()
+        page.get_by_text("待补发", exact=True).wait_for()
+        page.get_by_text("3 条", exact=True).wait_for()
+        assert "已写入存储分区" in grid.inner_text()
+        assert "已异常 11 分钟" in grid.inner_text()
+
+        # A degraded dedup journal must be visible: it explains a possible duplicate push.
+        first.journal_broken = True
+        page.evaluate("refresh()")
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('去重日志异常')")
+        first.journal_broken = False
+
+        # If the backlog store failed to start, the card must say so, not disappear.
+        first.spool_broken = True
+        page.evaluate("refresh()")
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('缓存未能启动')")
+        first.spool_broken = False
+
+        # Without any diagnostics in the payload the cards fall back to "unknown" and
+        # never claim the device is healthy.
+        first.hide_diagnostics = True
+        page.evaluate("refresh()")
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('状态未知')")
+        first.hide_diagnostics = False
+        page.evaluate("refresh()")
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('待补发')")
 
         first.available = False
         page.evaluate("refresh()")
@@ -367,7 +416,10 @@ def test_firmware_upload(page, server, url, token) -> None:
     upload.click()
     confirm.click()
     page.get_by_text("设备可能已经开始重启", exact=False).wait_for()
-    assert "/web" in result.inner_text()
+    # The token is now derived from the chip MAC, so a restart never requires a new
+    # /web link; the page must say "refresh", never "get a new link".
+    assert "/web" not in result.inner_text()
+    assert "刷新" in result.inner_text()
     assert upload.is_disabled()
     assert len(server.firmware_requests) == 2
 
@@ -391,7 +443,8 @@ def test_firmware_upload(page, server, url, token) -> None:
     upload.click()
     confirm.click()
     page.get_by_text("设备已接受固件 1.2.4", exact=False).wait_for()
-    assert "/web" in result.inner_text()
+    assert "/web" not in result.inner_text()
+    assert "刷新" in result.inner_text()
     assert len(server.firmware_requests) == 3
     page.goto(url)
     system.click()

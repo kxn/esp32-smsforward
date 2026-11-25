@@ -405,7 +405,7 @@
       }
       .network-grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
         gap: 12px;
       }
       .network-card {
@@ -1529,7 +1529,7 @@
               body: JSON.stringify({ ...obj, id: S.seq++ }),
             });
           } catch (error) {
-            throw new Error(error?.name === "AbortError" ? "设备响应超时" : "设备暂不可达，请检查 Wi-Fi 或重新获取 /web 链接");
+            throw new Error(error?.name === "AbortError" ? "设备响应超时" : "设备暂不可达，请检查 Wi-Fi 或刷新页面重试");
           }
           if (response.status === 401 || response.status === 403) {
             if (S.lanToken === token) lockLan("管理授权已失效，请在飞书私聊发送 /web 获取新链接");
@@ -1789,6 +1789,8 @@
           ["Wi-Fi", "未连接", "设备未连接"],
           ["飞书", "状态未知", "设备未连接"],
           ["设备时间", "状态未知", "设备未连接"],
+          ["上行网络", "状态未知", "设备未连接"],
+          ["待补发", "状态未知", "设备未连接"],
         ]
           .map(
             ([k, v, d]) =>
@@ -1853,6 +1855,8 @@
             : fs.configured
               ? "未连接"
               : "未配置";
+        const net = d.net || {},
+          spool = d.spool || {};
         const items = [
           [
             "Wi-Fi",
@@ -1863,7 +1867,8 @@
           [
             "飞书",
             fsState,
-            fs.app_id || "应用未配置",
+            (fs.app_id || "应用未配置") +
+              (fs.state === "online" && fs.alive === false ? " · 长连接无数据" : ""),
             fs.state === "online" ? "state-good" : "state-warn",
           ],
           [
@@ -1873,6 +1878,55 @@
             time.synced ? "state-good" : "state-warn",
           ],
         ];
+        /* Uplink and the offline backlog are the two things that used to be
+         * invisible while everything else looked healthy. */
+        if (net.internet_ok === undefined) {
+          /* Absent diagnostics mean an older firmware or a cached page; say so
+           * instead of silently dropping the row and looking healthy. */
+          items.push(["上行网络", "状态未知", "此版本无诊断数据", "state-warn"]);
+        } else {
+          const probe = `DNS ${net.dns_ok ? "正常" : "异常"} · TCP ${net.tcp_ok ? "正常" : "异常"}`;
+          const downMin = net.down_ms ? Math.round(net.down_ms / 60000) : 0;
+          const outages = Number(net.outages || 0);
+          const restarted = net.auto_restarted ? " · 已自动重启过" : "";
+          items.push([
+            "上行网络",
+            net.internet_ok ? "正常" : "不可达",
+            net.internet_ok
+              ? `${probe}${outages ? ` · 累计异常 ${outages} 次` : ""}`
+              : `${probe}${downMin ? ` · 已异常 ${downMin} 分钟` : ""}${restarted}`,
+            net.internet_ok ? "state-good" : "state-warn",
+          ]);
+        }
+        if (!spool) {
+          items.push(["待补发", "状态未知", "此版本无诊断数据", "state-warn"]);
+        } else if (spool.pending === undefined) {
+          /* The store failed to start: say so instead of hiding the card, which
+           * would render the worst case as "all healthy". */
+          items.push(["待补发", "不可用", "缓存未能启动", "state-warn"]);
+        } else {
+          const pending = Number(spool.pending || 0);
+          const calls = Number(spool.pending_calls || 0);
+          const dropped = Number(spool.dropped || 0);
+          const cap = Number(spool.capacity || 0);
+          const room = Number(spool.storage_free_bytes);
+          const failed = spool.persist_failed
+            ? ` · 写入失败${Number.isFinite(room) ? `（存储剩余 ${Math.round(room / 1024)} KB）` : ""}`
+            : "";
+          /* journal_ok=false: the dedup journal is degraded, so a crash may resend a
+           * message that was already forwarded.  Worth showing, not worth alarming. */
+          const dedup = d.sms && d.sms.journal_ok === false ? " · 去重日志异常" : "";
+          items.push([
+            "待补发",
+            pending ? `${pending} 条` : "无",
+            pending
+              ? `来电 ${calls} 条 · ${spool.durable ? "已写入存储分区" : "仅在内存"}${cap ? ` · 上限 ${cap} 条` : ""}${dropped ? ` · 丢弃 ${dropped} 条` : ""}${failed}${dedup}`
+              : dropped
+                ? `曾丢弃 ${dropped} 条（缓存满）${failed}${dedup}`
+                : `暂无积压${dedup}`,
+            pending || dropped || spool.persist_failed || dedup ? "state-warn" : "state-good",
+          ]);
+        }
         $("networkGrid").innerHTML = items
           .map(
             ([k, v, detail, state]) =>
@@ -2183,7 +2237,7 @@
         progress.removeAttribute("value");
         progress.hidden = false;
         result.textContent = "正在上传固件包…";
-        const checkVersion = "请等待设备启动，在飞书私聊发送 /web 获取新链接，然后在系统页核对当前版本。";
+        const checkVersion = "请等待设备重新上线，刷新本页即可在系统页核对当前版本；页面打不开时把链接里的 IP 换成设备的新地址。";
         try {
           await S.statusRefresh;
           if (S.lanToken !== token) {
