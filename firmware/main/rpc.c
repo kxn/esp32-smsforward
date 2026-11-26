@@ -11,6 +11,7 @@
 #include "net_health.h"
 #include "sms.h"
 #include "sms_spool.h"
+#include "peer_mark.h"
 #include "factory_reset.h"
 #include "firmware_update.h"
 #include "runtime.h"
@@ -214,6 +215,23 @@ static cJSON *status_data(void)
          * a crash); sweep_ms shows how far the idle SIM sweep has backed off. */
         cJSON_AddBoolToObject(sms, "journal_ok", sms_journal_ok());
         cJSON_AddNumberToObject(sms, "sweep_ms", (double)sms_sweep_delay_ms());
+    }
+    cJSON *mark = cJSON_AddObjectToObject(data, "mark");
+    if (mark) {
+        /* The key itself is never echoed back; enabled only reports whether a
+         * service URL is configured. */
+        cJSON_AddBoolToObject(mark, "enabled", peer_mark_enabled());
+        /* The template is not secret (only the key is); showing it lets the
+         * settings page round-trip without echoing the key. */
+        cJSON_AddStringToObject(mark, "url", cfg->mark_url);
+        cJSON_AddNumberToObject(mark, "queries", (double)peer_mark_queries());
+        cJSON_AddNumberToObject(mark, "timeouts", (double)peer_mark_timeouts());
+        cJSON_AddNumberToObject(mark, "failures", (double)peer_mark_failures());
+        cJSON_AddNumberToObject(mark, "cache", (double)peer_mark_cache_entries());
+        cJSON_AddNumberToObject(mark, "last_ms", (double)peer_mark_last_ms());
+        cJSON_AddNumberToObject(mark, "last_bytes", (double)peer_mark_last_bytes());
+        cJSON_AddStringToObject(mark, "last_label", peer_mark_last_label());
+        cJSON_AddNumberToObject(mark, "timeout_ms", (double)cfg->mark_timeout_ms);
     }
     cJSON_AddStringToObject(wifi, "ssid", ssid);
     cJSON_AddStringToObject(wifi, "ip", ip);
@@ -435,6 +453,53 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
             cfg_mut()->tz_offset = (int8_t)offset;
             if (cfg_save() != ESP_OK) { cfg_mut()->tz_offset = old; err = "save_failed"; }
             else cfg_apply_timezone();
+        }
+    } else if (!strcmp(cmd, "mark_set")) {
+        app_cfg_t backup = *cfg_get(), candidate = backup;
+        bool present;
+        const char *value = json_string(root, "url", &present);
+        if (present) {
+            if (!value) err = "url";
+            else if (!copy_bounded(candidate.mark_url, sizeof(candidate.mark_url), value, 191,
+                                   true))
+                err = "url";
+            else if (candidate.mark_url[0] &&
+                     (!strstr(candidate.mark_url, "{number}") ||
+                      (strncmp(candidate.mark_url, "http://", 7) != 0 &&
+                       strncmp(candidate.mark_url, "https://", 8) != 0)))
+                err = "url";
+        }
+        value = json_string(root, "key", &present);
+        if (!err && present) {
+            if (!value) err = "key";
+            else if (!copy_bounded(candidate.mark_key, sizeof(candidate.mark_key), value, 63, true))
+                err = "key";
+        }
+        if (!err) {
+            int timeout = 0;
+            if (exact_integer(cJSON_GetObjectItemCaseSensitive(root, "timeout_ms"), 500, 5000,
+                              &timeout))
+                candidate.mark_timeout_ms = (uint16_t)timeout;
+        }
+        if (!err) {
+            *cfg_mut() = candidate;
+            if (cfg_save() != ESP_OK) { *cfg_mut() = backup; err = "save_failed"; }
+        }
+    } else if (!strcmp(cmd, "mark_test")) {
+        /* Lets the owner check the configured service without waiting for a call. */
+        bool has_number = false;
+        const char *number = json_string(root, "number", &has_number);
+        if (!peer_mark_enabled()) err = "not_configured";
+        else if (!has_number || !number || !number[0] || strlen(number) > 24) err = "number";
+        else {
+            const char *label = peer_mark_lookup(number);
+            data = cJSON_CreateObject();
+            if (!data) err = "memory";
+            else {
+                cJSON_AddStringToObject(data, "label", label ? label : "");
+                cJSON_AddNumberToObject(data, "ms", peer_mark_last_ms());
+                cJSON_AddNumberToObject(data, "bytes", peer_mark_last_bytes());
+            }
         }
     } else if (!strcmp(cmd, "reboot")) {
         if (!firmware_restart_reserve()) err = "firmware_busy";

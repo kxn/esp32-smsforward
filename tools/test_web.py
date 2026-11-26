@@ -169,6 +169,15 @@ class LanHandler(Handler):
                 response["err"] = "confirm_required"
             self._json(200, response)
             return
+        if request.get("cmd") == "mark_set":
+            self.server.mark_requests.append(request)
+            self._json(200, {"id": request.get("id"), "ok": True})
+            return
+        if request.get("cmd") == "mark_test":
+            self.server.mark_tests.append(request)
+            self._json(200, {"id": request.get("id"), "ok": True,
+                             "data": {"label": "快递送餐", "ms": 321}})
+            return
         if request.get("cmd") != "status":
             self._json(200, {"id": request.get("id"), "ok": True})
             return
@@ -184,6 +193,9 @@ class LanHandler(Handler):
                               {"pending": 3, "pending_calls": 1, "added": 3, "dropped": 0,
                                "durable": True, "persist_failed": False})
             extra["sms"] = {"journal_ok": not self.server.journal_broken, "sweep_ms": 30000}
+            extra["mark"] = {"enabled": True, "url": self.server.mark_url,
+                             "timeout_ms": 2000, "queries": 7, "timeouts": 1, "failures": 0,
+                             "cache": 3, "last_ms": 120, "last_label": "快递送餐"}
         self._json(200, {"id": request.get("id"), "ok": True, "data": {
             "slots": [
                 {"n": 1, "name": "LAN 主卡", "num": "13800138000", "reg": True, "op": "运营商", "csq": 20},
@@ -215,6 +227,9 @@ def start_lan_server(token):
     server.spool_broken = False
     server.journal_broken = False
     server.factory_requests = []
+    server.mark_requests = []
+    server.mark_tests = []
+    server.mark_url = "https://api.example.test/mark?key={key}&phone={number}"
     server.firmware_requests = []
     server.firmware_release = threading.Event()
     server.firmware_release.set()
@@ -300,6 +315,32 @@ def test_lan_mode(browser) -> None:
         page.evaluate("refresh()")
         page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('去重日志异常')")
         first.journal_broken = False
+
+        # The optional number-mark lookup shows its counters only when configured.
+        page.wait_for_function("document.querySelector('#networkGrid').innerText.includes('号码标记')")
+        assert "快递送餐" in grid.inner_text()
+        assert "超时/失败 1 次" in grid.inner_text()
+
+        # The settings view round-trips the template and saves without echoing the key.
+        page.get_by_role("button", name="号码标记", exact=True).click()
+        page.locator("#view-mark").wait_for(state="visible")
+        page.wait_for_function("document.querySelector('#markurl').value.includes('{number}')")
+        first.mark_requests.clear()
+        page.locator("#markkey").fill("test-key")
+        page.locator("#btnSaveMark").click()
+        page.wait_for_function("document.querySelector('#markkey').value === ''")
+        assert first.mark_requests, "mark_set was not sent"
+        sent = first.mark_requests[-1]
+        assert sent["url"].endswith("{number}") and sent["key"] == "test-key"
+        assert sent["timeout_ms"] == 2000
+        page.locator("#marktest").fill("13800138000")
+        page.locator("#btnTestMark").click()
+        page.wait_for_function(
+            "document.querySelector('#markTestResult').textContent.includes('快递送餐')"
+        )
+        assert first.mark_tests and first.mark_tests[-1]["number"] == "13800138000"
+        page.get_by_role("button", name="设备概览", exact=True).click()
+        page.locator("#view-overview").wait_for(state="visible")
 
         # If the backlog store failed to start, the card must say so, not disappear.
         first.spool_broken = True

@@ -3,6 +3,7 @@
 #include "sms_spool.h"
 #include "pdu.h"
 #include "sms.h"
+#include "peer_mark.h"
 #include "pbbp2.h"
 #include "cmd.h"
 #include "cmd_policy.h"
@@ -383,6 +384,21 @@ static void cmd_wifi(const char *args)
     printf("\nwifi saved: %s\n", ssid);
 }
 
+static void cmd_mark(void)
+{
+    const app_cfg_t *c = cfg_get();
+    printf("\n--- mark ---\n");
+    printf("service : %s\n", c->mark_url[0] ? "configured" : "off");
+    printf("key     : %s\n", c->mark_key[0] ? "set" : "(none)");
+    printf("timeout : %u ms\n", (unsigned)c->mark_timeout_ms);
+    printf("queries : %u (%u timeouts, %u failures)\n", peer_mark_queries(),
+           peer_mark_timeouts(), peer_mark_failures());
+    printf("cache   : %u entries\n", peer_mark_cache_entries());
+    if (peer_mark_last_label()[0])
+        printf("last    : %s (%u ms)\n", peer_mark_last_label(), (unsigned)peer_mark_last_ms());
+    printf("------------\n");
+}
+
 static void cmd_net(void)
 {
     const app_cfg_t *c = cfg_get();
@@ -408,6 +424,7 @@ static void cmd_help(void)
            "m2 <AT>         向模组2发 AT\n"
            "p1 / p2 / pa    探活序列（pa=两张卡）\n"
            "net             网络、飞书长连接与上行探测状态\n"
+           "mark            来电标记查询的配置与统计\n"
            "wifi <ssid> <pass>        设置 Wi-Fi\n"
            "fset <app_id> <app_secret> 设置飞书应用\n"
            "r1 / r2         硬件复位模组\n"
@@ -458,6 +475,8 @@ static void handle_line(char *line)
         cmd_wifi(line + 5);
     } else if (!strcmp(line, "net")) {
         cmd_net();
+    } else if (!strcmp(line, "mark")) {
+        cmd_mark();
     } else if (!strcmp(line, "save")) {
         cfg_save();
         printf("\nsaved\n");
