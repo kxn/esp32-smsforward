@@ -82,10 +82,33 @@ int main(void)
     expect_label("120", PHONE_ORIGIN_SERVICE, "急救");
     expect_label("12345", PHONE_ORIGIN_SERVICE, "政务服务便民热线");
     expect_label("12306", PHONE_ORIGIN_SERVICE, "铁路12306");
-    expect_label("95598", PHONE_ORIGIN_SERVICE, "国家电网");
+    expect_label("95598", PHONE_ORIGIN_SERVICE, "国家电网/南方电网");
     expect_label("4001234567", PHONE_ORIGIN_SERVICE, "企业客服");
     expect_label("8001234567", PHONE_ORIGIN_SERVICE, "企业客服");
     expect_label("40012345", PHONE_ORIGIN_UNKNOWN, NULL);
+
+    /* 95 numbers published in the MIIT customer service number table. */
+    expect_label("95338", PHONE_ORIGIN_SERVICE, "顺丰速运");
+    expect_label("95311", PHONE_ORIGIN_SERVICE, "中通快递");
+    expect_label("95306", PHONE_ORIGIN_SERVICE, "中国铁路");
+    expect_label("95583", PHONE_ORIGIN_SERVICE, "中国国际航空");
+    expect_label("95598", PHONE_ORIGIN_SERVICE, "国家电网/南方电网");
+    expect_label("956000", PHONE_ORIGIN_SERVICE, "利宝保险");
+    expect_label("956166", PHONE_ORIGIN_SERVICE, "浙江稠州商业银行");
+
+    /* 106 short message gateways. Banks publish "1069800" plus their five digit
+     * customer service number, everything else is a generic corporate port. */
+    expect_label("106980095533", PHONE_ORIGIN_SERVICE, "中国建设银行");
+    expect_label("106980095508", PHONE_ORIGIN_SERVICE, "广发银行");
+    expect_label("106980095555", PHONE_ORIGIN_SERVICE, "招商银行");
+    expect_label("106980099999", PHONE_ORIGIN_SERVICE, "企业短信服务号");
+    expect_label("106900009999", PHONE_ORIGIN_SERVICE, "企业短信服务号");
+    expect_label("106212345678", PHONE_ORIGIN_SERVICE, "企业短信服务号");
+    expect_label("106571234567", PHONE_ORIGIN_SERVICE, "企业短信服务号");
+    /* Not a port: too short, or a sub-band the plan never allocated. */
+    expect_label("1069800955", PHONE_ORIGIN_UNKNOWN, NULL);
+    expect_label("1061234567", PHONE_ORIGIN_UNKNOWN, NULL);
+    expect_label("106123456789", PHONE_ORIGIN_UNKNOWN, NULL);
 
     /* International numbers, in all three shapes the network can send. */
     expect_label("+14155551234", PHONE_ORIGIN_ABROAD, "美国/加拿大");

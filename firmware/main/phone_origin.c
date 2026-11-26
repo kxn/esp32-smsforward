@@ -153,8 +153,49 @@ static bool lookup_area(const char *digits, size_t length, const char **label)
     return false;
 }
 
+/* 106 is the short message service access code. 1062/1063/1066 are handed out
+ * by the provincial administrations, 1065/1068/1069 by the ministry, and 1069
+ * is the three-network gateway. Institutions such as banks send notifications
+ * through a 1069 port and a widely used convention is "1069800" followed by
+ * their five digit customer service number: 106980095533 is China Construction
+ * Bank, 106980095508 is China Guangfa Bank. Only that documented shape is
+ * resolved to an institution; every other 106 number is reported as a generic
+ * corporate short message gateway, because the SP code behind it is not
+ * something we can verify offline. */
+static phone_origin_kind_t lookup_short_message(const char *digits, size_t length, const char **label)
+{
+    /* A port is 106 plus the eight digit management code: eleven digits for
+     * 1065/1068, twelve for 1069. The fourth digit selects the sub-band and
+     * only 1062/1063/1065/1066/1068/1069 exist, so anything else is a number
+     * that merely looks like a port and must not be guessed at. */
+    if (length != 11 && length != 12) return PHONE_ORIGIN_UNKNOWN;
+    switch (digits[3]) {
+    case '2':
+    case '3':
+    case '5':
+    case '6':
+    case '8':
+    case '9':
+        break;
+    default:
+        return PHONE_ORIGIN_UNKNOWN;
+    }
+    if (length == 12 && memcmp(digits, "1069800", 7) == 0 &&
+        find_service(digits_u32(digits + 7, 5), label)) {
+        return PHONE_ORIGIN_SERVICE;
+    }
+    if (label) *label = label_at(ORIGIN_SMS_LABEL);
+    return PHONE_ORIGIN_SERVICE;
+}
+
 static phone_origin_kind_t lookup_domestic(const char *digits, size_t length, const char **label)
 {
+    /* 106 ports start with '1' like a mobile number but are eleven to thirteen
+     * digits long, so they have to be recognised before the mobile test. */
+    if (length >= 10 && digits[0] == '1' && digits[1] == '0' && digits[2] == '6') {
+        return lookup_short_message(digits, length, label);
+    }
+
     /* Mainland mobile numbers are handed to the prefix table unchanged so both
      * lookups keep using the same normalisation rules. */
     if (length == 11 && digits[0] == '1') {
@@ -163,7 +204,7 @@ static phone_origin_kind_t lookup_domestic(const char *digits, size_t length, co
         return PHONE_ORIGIN_MOBILE;
     }
 
-    if (length <= 5 && find_service(digits_u32(digits, length), label)) {
+    if (length <= 6 && find_service(digits_u32(digits, length), label)) {
         return PHONE_ORIGIN_SERVICE;
     }
 

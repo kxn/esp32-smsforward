@@ -227,7 +227,7 @@ def build_services():
         if len(parts) != 2:
             raise ValueError(f"Unexpected service line {line!r} in {SERVICES}")
         number, label = parts
-        if not re.fullmatch(r"\d{3,5}", number):
+        if not re.fullmatch(r"\d{3,6}", number):
             raise ValueError(f"Unexpected service number {number}")
         if not label or "\0" in label:
             raise ValueError(f"Invalid service label for {number}")
@@ -276,6 +276,7 @@ def c_array(type_name, name, values, width=12):
 def build_output(area_codes, countries, services):
     labels = Labels()
     bulk = labels.id_of("企业客服")
+    sms = labels.id_of("企业短信服务号")
 
     area_numbers = sorted(area_codes)
     area_labels = [labels.id_of(area_codes[number]) for number in area_numbers]
@@ -312,7 +313,8 @@ def build_output(area_codes, countries, services):
         f"       ORIGIN_AREA_COUNT = {len(area_numbers)},",
         f"       ORIGIN_COUNTRY_COUNT = {len(country_numbers)},",
         f"       ORIGIN_SERVICE_COUNT = {len(service_numbers)},",
-        f"       ORIGIN_BULK_LABEL = {bulk} }};",
+        f"       ORIGIN_BULK_LABEL = {bulk},",
+        f"       ORIGIN_SMS_LABEL = {sms} }};",
         "",
     ]
     body = [
