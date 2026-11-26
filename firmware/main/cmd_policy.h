@@ -195,10 +195,13 @@ static inline int cmd_policy_format_message_notice(char *out, size_t outlen,
                     body && body[0]?"\n\n":"",body?body:"");
 }
 
+/* label is the caller's origin text (address, and optionally an online mark);
+ * it is computed by the caller so this formatter stays free of lookups. */
 static inline int cmd_policy_format_call_notice(char *out, size_t outlen, int slot,
                                                 const char *slot_name,
                                                 const char *local_number,
                                                 const char *caller,
+                                                const char *label,
                                                 time_t ring_time,
                                                 bool time_synced)
 {
@@ -207,7 +210,7 @@ static inline int cmd_policy_format_call_notice(char *out, size_t outlen, int sl
     char caller_text[48], local_text[48], timebuf[32];
     cmd_policy_display_phone(caller,caller_text,sizeof(caller_text));
     cmd_policy_display_phone(local_number,local_text,sizeof(local_text));
-    const char *region = phone_origin_label(caller);
+    const char *region = (label && label[0]) ? label : NULL;
     struct tm tmv;
     if (!localtime_r(&ring_time,&tmv) || !strftime(timebuf,sizeof(timebuf),"%Y-%m-%d %H:%M:%S",&tmv)) return -1;
     return snprintf(out,outlen,"【接到来自%s%s%s%s的来电】\n接收号码：%s\n接收时间：%s%s",

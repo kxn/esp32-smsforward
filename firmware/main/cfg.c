@@ -23,6 +23,7 @@ void cfg_defaults(void)
     memset(&s_cfg, 0, sizeof(s_cfg));
     s_cfg.dhcp = true;
     s_cfg.tz_offset = 8;
+    s_cfg.mark_timeout_ms = MARK_TIMEOUT_DEFAULT_MS;
     strlcpy(s_cfg.slot_name[0], "卡1", sizeof(s_cfg.slot_name[0]));
     strlcpy(s_cfg.slot_name[1], "卡2", sizeof(s_cfg.slot_name[1]));
 }
@@ -36,12 +37,14 @@ void cfg_apply_timezone(void)
     tzset();
 }
 
+/* Reads straight into the caller's buffer: NVS wants the buffer size in *n and
+ * rejects a value that does not fit, so no intermediate copy is needed (and a
+ * long field such as the mark URL template is not silently dropped). */
 static void get_str(nvs_handle_t h, const char *key, char *out, size_t len)
 {
-    char value[sizeof(s_cfg.app_secret)];
+    if (!out || len == 0) return;
     size_t n = len;
-    if (len <= sizeof(value) && nvs_get_str(h, key, value, &n) == ESP_OK)
-        memcpy(out, value, n);
+    if (nvs_get_str(h, key, out, &n) != ESP_OK) out[0] = '\0';
 }
 
 esp_err_t cfg_init(void)
@@ -73,6 +76,13 @@ esp_err_t cfg_init(void)
     get_str(h, "slot2_name", s_cfg.slot_name[1], sizeof(s_cfg.slot_name[1]));
     get_str(h, "slot1_num", s_cfg.slot_num[0], sizeof(s_cfg.slot_num[0]));
     get_str(h, "slot2_num", s_cfg.slot_num[1], sizeof(s_cfg.slot_num[1]));
+    get_str(h, "mark_url", s_cfg.mark_url, sizeof(s_cfg.mark_url));
+    get_str(h, "mark_key", s_cfg.mark_key, sizeof(s_cfg.mark_key));
+
+    uint16_t mark_ms = MARK_TIMEOUT_DEFAULT_MS;
+    if (nvs_get_u16(h, "mark_ms", &mark_ms) == ESP_OK && mark_ms >= MARK_TIMEOUT_MIN_MS &&
+        mark_ms <= MARK_TIMEOUT_MAX_MS)
+        s_cfg.mark_timeout_ms = mark_ms;
 
     uint8_t v = 1;
     nvs_get_u8(h, "dhcp", &v);
@@ -119,6 +129,9 @@ esp_err_t cfg_save(void)
     SET(nvs_set_str(h, "slot1_num", s_cfg.slot_num[0]));
     SET(nvs_set_str(h, "slot2_num", s_cfg.slot_num[1]));
     SET(nvs_set_i8(h, "tz", s_cfg.tz_offset));
+    SET(nvs_set_str(h, "mark_url", s_cfg.mark_url));
+    SET(nvs_set_str(h, "mark_key", s_cfg.mark_key));
+    SET(nvs_set_u16(h, "mark_ms", s_cfg.mark_timeout_ms));
 
     err = nvs_commit(h);
 done:

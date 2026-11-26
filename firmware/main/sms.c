@@ -9,6 +9,8 @@
 #include "sms_text.h"
 #include "sms_time_policy.h"
 #include "sms_spool.h"
+#include "peer_mark.h"
+#include "peer_mark_core.h"
 #include "cmd_policy.h"
 #include "modem_timing.h"
 #include "wap_mms.h"
@@ -719,17 +721,36 @@ static void call_notice(int slot, const char *peer, time_t ring_time,
     char dial[40],display[40];
     const char *caller=(peer && peer[0])?peer:unknown;
     bool valid_peer=peer && cmd_policy_dial_number(peer,dial,sizeof(dial),display,sizeof(display));
-    char text[384];
-    int n=cmd_policy_format_call_notice(text,sizeof(text),slot,cmd_slot_name(slot),
-                                        cmd_slot_number(slot),caller,ts,synced);
-    if(n<0 || (size_t)n>=sizeof(text)) return;
     /* A missed call has no durable home (unlike SMS, which the SIM card keeps), so
      * an unreachable Feishu used to drop it for good.  Park it with its ring time
      * and replay once the link is back. */
+    bool will_send = feishu_configured() && !feishu_path_down();
+    const char *region = phone_origin_label(caller);
+    const char *label = region;
+    char merged[96];
+    /* The online mark is opt-in: with no service configured this branch costs one
+     * config read and nothing else. */
+    if (will_send && valid_peer && peer_mark_enabled()) {
+        /* Only callers we cannot name locally are worth a network round trip, and
+         * the lookup gives up after its own budget, so a slow service costs a
+         * second or two at worst. */
+        const char *local_label = NULL;
+        if (phone_origin_lookup(caller, &local_label) != PHONE_ORIGIN_SERVICE) {
+            const char *mark = peer_mark_lookup(peer);
+            if (mark && mark[0]) {
+                peer_mark_join_label(merged, sizeof(merged), region, mark);
+                label = merged;
+            }
+        }
+    }
+    char text[384];
+    int n=cmd_policy_format_call_notice(text,sizeof(text),slot,cmd_slot_name(slot),
+                                        cmd_slot_number(slot),caller,label,ts,synced);
+    if(n<0 || (size_t)n>=sizeof(text)) return;
     uint64_t fingerprint = sms_fingerprint(slot, caller, ts, text);
     char record_id[24];
     snprintf(record_id, sizeof(record_id), "call_%016" PRIx64, fingerprint);
-    if (!feishu_configured() || feishu_path_down()) {
+    if (!will_send) {
         spool_park(SMS_SPOOL_KIND_CALL, slot, ts, synced, fingerprint, peer, record_id, text);
         return;
     }

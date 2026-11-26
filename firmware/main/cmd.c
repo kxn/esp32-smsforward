@@ -549,7 +549,8 @@ int cmd_selftest(char *report, size_t report_len)
     used+=k>0?k:0;
 
     ok=cmd_policy_format_call_notice(buf,sizeof(buf),1,"工作卡","+8615550000002",
-                                     "10086",1763900000,true)>0 &&
+                                     "10086",phone_origin_label("10086"),
+                                     1763900000,true)>0 &&
        strstr(buf,"【接到来自10086的来电】") && strstr(buf,"接收号码：15550000002") &&
        strstr(buf,"接收时间：") && !strstr(buf,"卡槽") && !strstr(buf,"自动挂断") && !strstr(buf,"呼转");
     if(!ok) fails++;

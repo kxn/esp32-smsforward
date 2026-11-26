@@ -23,6 +23,7 @@
 #include "cmd_policy.h"
 #include "sim_number_policy.h"
 #include "cfg.h"
+#include "peer_mark.h"
 #include "wifi.h"
 #include "ble.h"
 #include "lan_web.h"
@@ -402,6 +403,7 @@ void app_main(void)
         ESP_LOGE(TAG, "configuration load failed: %s; startup is held", esp_err_to_name(cfg_err));
         for (;;) vTaskDelay(pdMS_TO_TICKS(5000));
     }
+    peer_mark_init();
     esp_err_t storage_err = storage_mount();
     if (storage_err != ESP_OK) ESP_LOGE(TAG, "storage unavailable: %s", esp_err_to_name(storage_err));
     /* Pending events (SMS/call notices the outage could not forward) are restored
