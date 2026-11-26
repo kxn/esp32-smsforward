@@ -223,7 +223,10 @@ def build_services():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        number, label = line.split("\t")
+        parts = line.split("\t")
+        if len(parts) != 2:
+            raise ValueError(f"Unexpected service line {line!r} in {SERVICES}")
+        number, label = parts
         if not re.fullmatch(r"\d{3,5}", number):
             raise ValueError(f"Unexpected service number {number}")
         if not label or "\0" in label:
@@ -280,6 +283,14 @@ def build_output(area_codes, countries, services):
     country_labels = [labels.id_of(countries[number]) for number in country_numbers]
     service_numbers = sorted(services)
     service_labels = [labels.id_of(services[number]) for number in service_numbers]
+
+    # The generated C indexes labels with uint16_t ids and offsets.
+    if len(labels.list) > 0xFFFF:
+        raise ValueError(f"{len(labels.list)} labels do not fit the uint16_t ids")
+    if labels.size > 0xFFFF:
+        raise ValueError(f"{labels.size} B of labels do not fit the uint16_t offsets")
+    if any(number > 0xFFFF for number in area_numbers + country_numbers):
+        raise ValueError("Area or country code does not fit uint16_t")
 
     offsets = list(labels.offsets) + [labels.size]
     header = [

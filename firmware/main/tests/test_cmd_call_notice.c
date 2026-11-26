@@ -41,6 +41,18 @@ int main(void)
     if (n <= 0 || (size_t)n >= sizeof(text) || strcmp(text, expected) != 0 ||
         strstr(text, "卡槽") || strstr(text, "挂断") || strstr(text, "响铃")) return 3;
 
+    n = cmd_policy_format_call_notice(text, sizeof(text), 0, "个人卡",
+        "13900139000", "01021285387", ts, true);
+    snprintf(expected, sizeof(expected),
+        "【接到来自01021285387（北京）的来电】\n接收号码：13900139000\n接收时间：%s", timebuf);
+    if (n <= 0 || (size_t)n >= sizeof(text) || strcmp(text, expected) != 0) return 9;
+
+    n = cmd_policy_format_call_notice(text, sizeof(text), 0, "个人卡",
+        "13900139000", "95555", ts, true);
+    snprintf(expected, sizeof(expected),
+        "【接到来自95555（招商银行）的来电】\n接收号码：13900139000\n接收时间：%s", timebuf);
+    if (n <= 0 || (size_t)n >= sizeof(text) || strcmp(text, expected) != 0) return 10;
+
     n = cmd_policy_format_call_notice(text, sizeof(text), 1, "工作卡",
         "未知", NULL, ts, false);
     snprintf(expected, sizeof(expected),

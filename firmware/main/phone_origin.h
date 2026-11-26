@@ -25,7 +25,9 @@ typedef enum {
  * `label` may receive NULL even on a recognised kind, for example when the
  * mobile prefix is not in the allocation table. Forms accepted: bare digits,
  * a leading '+' and the '00' international prefix, with optional separators
- * such as spaces, dashes and brackets. */
+ * such as spaces, dashes and brackets. A '+86' or '0086' prefix marks the
+ * number as mainland; the trunk '0' that the international form drops is put
+ * back before the landline area code is looked up. */
 phone_origin_kind_t phone_origin_lookup(const char *number, const char **label);
 
 /* Convenience wrapper that returns only the label, or NULL when unknown. */

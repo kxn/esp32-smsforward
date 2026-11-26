@@ -64,6 +64,12 @@ int main(void)
     expect_label("+8613800138000", PHONE_ORIGIN_MOBILE, mobile_region);
     expect_label("008613800138000", PHONE_ORIGIN_MOBILE, mobile_region);
     expect_label("8613800138000", PHONE_ORIGIN_MOBILE, mobile_region);
+    /* The international spelling of a mainland landline drops the trunk 0. */
+    expect_label("+861021285387", PHONE_ORIGIN_LANDLINE, "北京");
+    expect_label("00861021285387", PHONE_ORIGIN_LANDLINE, "北京");
+    expect_label("+862181234567", PHONE_ORIGIN_LANDLINE, "上海");
+    expect_label("+8675512345678", PHONE_ORIGIN_LANDLINE, "深圳");
+    expect_label("+861083001400", PHONE_ORIGIN_LANDLINE, "北京");
 
     /* Service numbers. */
     expect_label("95555", PHONE_ORIGIN_SERVICE, "招商银行");

@@ -57,9 +57,10 @@ static bool find_service(uint32_t key, const char **label)
  * the '00' international prefix. Drop separators, remember which shape it was
  * and copy the digits into `out`. Returns the digit count or 0 when the string
  * is not a number we understand. */
-static size_t collect_digits(const char *number, char *out, bool *international)
+static size_t collect_digits(const char *number, char *out, bool *international, bool *mainland)
 {
     *international = false;
+    *mainland = false;
     if (!number) return 0;
 
     size_t length = 0;
@@ -100,6 +101,7 @@ static size_t collect_digits(const char *number, char *out, bool *international)
         memmove(out, out + 2, length - 1);
         length -= 2;
         *international = false;
+        *mainland = true;
     }
     return length;
 }
@@ -120,28 +122,39 @@ static uint32_t digits_u32(const char *digits, size_t count)
 
 static phone_origin_kind_t lookup_abroad(const char *digits, size_t length, const char **label)
 {
-    /* Country calling codes are one to three digits; the longest match wins. */
-    for (size_t width = 3; width >= 1; --width) {
-        if (length < width) continue;
+    /* Country calling codes are one to three digits and no code is a prefix of
+     * another, so the longest match is also the only match. */
+    for (int width = 3; width >= 1; --width) {
+        if (length < (size_t)width) continue;
         if (find_u16(origin_country_codes, origin_country_labels, ORIGIN_COUNTRY_COUNT,
-                     digits_u16(digits, width), label)) {
+                     digits_u16(digits, (size_t)width), label)) {
             return PHONE_ORIGIN_ABROAD;
         }
     }
     return PHONE_ORIGIN_ABROAD;
 }
 
-phone_origin_kind_t phone_origin_lookup(const char *number, const char **label)
+static bool lookup_area(const char *digits, size_t length, const char **label)
 {
-    if (label) *label = NULL;
+    /* Area codes are '0' plus two or three digits. Try the longer form first;
+     * the two-digit trunk codes (010 and 02x) cannot be shadowed by it because
+     * every area code of that length starts with 3..9, so '0102' and '0208'
+     * never match an entry. */
+    if (length >= 4 &&
+        find_u16(origin_area_codes, origin_area_labels, ORIGIN_AREA_COUNT,
+                 digits_u16(digits, 4), label)) {
+        return true;
+    }
+    if (length >= 3 &&
+        find_u16(origin_area_codes, origin_area_labels, ORIGIN_AREA_COUNT,
+                 digits_u16(digits, 3), label)) {
+        return true;
+    }
+    return false;
+}
 
-    char digits[ORIGIN_MAX_DIGITS];
-    bool international = false;
-    size_t length = collect_digits(number, digits, &international);
-    if (length == 0) return PHONE_ORIGIN_UNKNOWN;
-
-    if (international) return lookup_abroad(digits, length, label);
-
+static phone_origin_kind_t lookup_domestic(const char *digits, size_t length, const char **label)
+{
     /* Mainland mobile numbers are handed to the prefix table unchanged so both
      * lookups keep using the same normalisation rules. */
     if (length == 11 && digits[0] == '1') {
@@ -162,22 +175,37 @@ phone_origin_kind_t phone_origin_lookup(const char *number, const char **label)
         return PHONE_ORIGIN_SERVICE;
     }
 
-    /* Mainland landline numbers are an area code followed by the subscriber
-     * number. Area codes are either '0' plus two digits or '0' plus three, so
-     * try the four-digit form first and fall back to three. */
     if (digits[0] == '0' && length >= 7) {
-        if (length >= 4 && find_u16(origin_area_codes, origin_area_labels, ORIGIN_AREA_COUNT,
-                                    digits_u16(digits, 4), label)) {
-            return PHONE_ORIGIN_LANDLINE;
-        }
-        if (length >= 3 && find_u16(origin_area_codes, origin_area_labels, ORIGIN_AREA_COUNT,
-                                    digits_u16(digits, 3), label)) {
-            return PHONE_ORIGIN_LANDLINE;
-        }
+        (void)lookup_area(digits, length, label);
         return PHONE_ORIGIN_LANDLINE;
     }
 
     return PHONE_ORIGIN_UNKNOWN;
+}
+
+phone_origin_kind_t phone_origin_lookup(const char *number, const char **label)
+{
+    if (label) *label = NULL;
+
+    char digits[ORIGIN_MAX_DIGITS];
+    bool international = false;
+    bool mainland = false;
+    size_t length = collect_digits(number, digits, &international, &mainland);
+    if (length == 0) return PHONE_ORIGIN_UNKNOWN;
+    if (international) return lookup_abroad(digits, length, label);
+
+    phone_origin_kind_t kind = lookup_domestic(digits, length, label);
+    if (kind != PHONE_ORIGIN_UNKNOWN || !mainland) return kind;
+
+    /* The international spelling of a mainland number drops the trunk '0':
+     * +86 10 … is 010… at home and +86 755 … is 0755…. Restore it and retry,
+     * which is the only way to label an internationally formatted landline. */
+    if (length + 2 > ORIGIN_MAX_DIGITS) return PHONE_ORIGIN_UNKNOWN;
+    char restored[ORIGIN_MAX_DIGITS];
+    restored[0] = '0';
+    memcpy(restored + 1, digits, length);
+    restored[length + 1] = '\0';
+    return lookup_domestic(restored, length + 1, label);
 }
 
 const char *phone_origin_label(const char *number)
