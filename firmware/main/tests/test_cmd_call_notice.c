@@ -1,4 +1,5 @@
 #include "../cmd_policy.h"
+#include "../phone_region.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -29,14 +30,14 @@ int main(void)
     n = cmd_policy_format_message_notice(text, sizeof(text), "彩信",
         "+12025550123", "+12025550123", "8613800138000", ts, true, NULL);
     snprintf(expected, sizeof(expected),
-        "【收到来自+12025550123的彩信】\n接收号码：13800138000\n接收时间：%s", timebuf);
+        "【收到来自+12025550123（美国/加拿大）的彩信】\n接收号码：13800138000\n接收时间：%s", timebuf);
     if (n <= 0 || (size_t)n >= sizeof(text) || strcmp(text, expected) != 0 ||
         strstr(text, "\n\n") != NULL) return 2;
 
     n = cmd_policy_format_call_notice(text, sizeof(text), 0, "个人卡",
         "13800138000", "10086", ts, true);
     snprintf(expected, sizeof(expected),
-        "【接到来自10086的来电】\n接收号码：13800138000\n接收时间：%s", timebuf);
+        "【接到来自10086（中国移动）的来电】\n接收号码：13800138000\n接收时间：%s", timebuf);
     if (n <= 0 || (size_t)n >= sizeof(text) || strcmp(text, expected) != 0 ||
         strstr(text, "卡槽") || strstr(text, "挂断") || strstr(text, "响铃")) return 3;
 

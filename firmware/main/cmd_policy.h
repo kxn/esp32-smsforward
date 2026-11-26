@@ -7,7 +7,7 @@
 #include <ctype.h>
 #include <time.h>
 
-#include "phone_region.h"
+#include "phone_origin.h"
 
 static inline bool cmd_policy_dial_number(const char *raw, char *dial, size_t dial_len,
                                           char *display, size_t display_len)
@@ -186,7 +186,7 @@ static inline int cmd_policy_format_message_notice(char *out, size_t outlen,
     char peer_text[48], local_text[48], timebuf[32];
     cmd_policy_display_phone(peer,peer_text,sizeof(peer_text));
     cmd_policy_display_phone(local_number,local_text,sizeof(local_text));
-    const char *region = phone_region_lookup(region_peer);
+    const char *region = phone_origin_label(region_peer);
     struct tm tmv;
     if (!localtime_r(&ts,&tmv) || !strftime(timebuf,sizeof(timebuf),"%Y-%m-%d %H:%M:%S",&tmv)) return -1;
     return snprintf(out,outlen,"【收到来自%s%s%s%s的%s】\n接收号码：%s\n接收时间：%s%s%s%s",
@@ -207,7 +207,7 @@ static inline int cmd_policy_format_call_notice(char *out, size_t outlen, int sl
     char caller_text[48], local_text[48], timebuf[32];
     cmd_policy_display_phone(caller,caller_text,sizeof(caller_text));
     cmd_policy_display_phone(local_number,local_text,sizeof(local_text));
-    const char *region = phone_region_lookup(caller);
+    const char *region = phone_origin_label(caller);
     struct tm tmv;
     if (!localtime_r(&ring_time,&tmv) || !strftime(timebuf,sizeof(timebuf),"%Y-%m-%d %H:%M:%S",&tmv)) return -1;
     return snprintf(out,outlen,"【接到来自%s%s%s%s的来电】\n接收号码：%s\n接收时间：%s%s",

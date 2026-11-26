@@ -469,7 +469,7 @@ static bool deliver_mms_notice(modem_t *m, const char *peer, time_t ts, const ch
         xSemaphoreGive(s_delivery_lock);
         return true;
     }
-    char out[280];
+    char out[384];
     bool synced = false;
     time_t display_ts = sms_display_time(m, ts, &synced);
     int formatted = cmd_policy_format_message_notice(out, sizeof(out), "彩信", peer, region_peer,
