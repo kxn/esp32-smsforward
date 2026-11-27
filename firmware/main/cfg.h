@@ -28,7 +28,12 @@ typedef struct {
     char mark_url[192];
     char mark_key[64];
     uint16_t mark_timeout_ms;
+
+    /* 0 = 关闭。到点后逐卡复位，避开通话和固件升级。 */
+    uint8_t modem_reset_hours;
 } app_cfg_t;
+
+#define MODEM_RESET_HOURS_MAX 168
 
 /* Bounds for the optional online mark lookup budget. */
 #define MARK_TIMEOUT_DEFAULT_MS 2000

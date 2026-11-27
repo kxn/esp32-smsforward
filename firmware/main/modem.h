@@ -139,7 +139,7 @@ esp_err_t modem_sms_pdu(modem_t *m, const char *pdu_hex, int tpdu_len,
 /* 文本模式发送（诊断用）：AT+CMGS="num" -> 文本 -> Ctrl-Z */
 esp_err_t modem_sms_text(modem_t *m, const char *dest, const char *text,
                          char *out, size_t outlen, int timeout_ms);
-void modem_reset_hw(modem_t *m);
+esp_err_t modem_reset_hw(modem_t *m);
 bool modem_is_desynced(modem_t *m);
 const char *modem_name(const modem_t *m);
 #endif

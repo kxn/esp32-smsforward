@@ -131,6 +131,42 @@ static bool delivery_map_stage(void *context)
 static uint32_t s_sweep_delay_ms = SMS_SWEEP_MIN_MS;
 static volatile unsigned s_forwarded_since_sweep;
 
+/* 收信活动计数：状态页据此区分"没收到短信"和"收到但没转发成功"。 */
+static sms_stats_t s_stats;
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void stats_bump(volatile unsigned *field)
+{
+    taskENTER_CRITICAL(&s_stats_mux);
+    (*field)++;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_mark(int64_t *field)
+{
+    int64_t now = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&s_stats_mux);
+    *field = now;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_sim_watermark(int slot, unsigned used, unsigned capacity)
+{
+    if (slot < 0 || slot >= MODEM_COUNT) return;
+    taskENTER_CRITICAL(&s_stats_mux);
+    s_stats.sim_used[slot] = used;
+    s_stats.sim_capacity[slot] = capacity;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
+void sms_get_stats(sms_stats_t *out)
+{
+    if (!out) return;
+    taskENTER_CRITICAL(&s_stats_mux);
+    *out = s_stats;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
 /* ---------------- 断网期间的待发送缓存 ---------------- */
 
 /* Parks one notification for later delivery.  The text was built once, at receipt
@@ -166,6 +202,8 @@ static bool spool_send_entry(const sms_spool_entry_t *e)
         if (e->kind == SMS_SPOOL_KIND_SMS) {
             /* Stop the retained SIM copy from being forwarded a second time. */
             sms_seen_commit(&s_seen, e->fingerprint);
+            stats_bump(&s_stats.delivered);
+            stats_mark(&s_stats.last_delivered_ms);
         }
         if (e->peer[0] && mid[0]) map_note_persisted(mid, e->slot, e->peer, e->record_id);
         __atomic_add_fetch(&s_forwarded_since_sweep, 1, __ATOMIC_RELAXED);
@@ -189,6 +227,16 @@ typedef struct {
 } sms_job_t;
 
 enum { SMS_JOB_READ = 1, SMS_JOB_SCAN_START, SMS_JOB_SCAN_STEP, SMS_JOB_FLUSH, SMS_JOB_CALL };
+
+/* 状态页"立即扫描"：把两张卡的扫描请求排进同一条队列。 */
+void sms_sweep_now(void)
+{
+    if (!s_sms_q || !s_modems) return;
+    for (int i = 0; i < MODEM_COUNT; i++) {
+        sms_job_t job = { .type = SMS_JOB_SCAN_START, .slot = i };
+        xQueueSend(s_sms_q, &job, 0);
+    }
+}
 
 /* ---------------- 闀跨煭淇℃嫾鎺?---------------- */
 
@@ -241,6 +289,8 @@ static void delete_sim_entry(modem_t *m, int idx, uint64_t expected)
     snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
     if (modem_cmd(m, cmd, NULL, 0, 5000) != ESP_OK)
         ESP_LOGW(TAG, "could not delete delivered SIM SMS %d", idx);
+    else
+        stats_bump(&s_stats.deletes);
 }
 
 /* After this many consecutive push failures the upstream is clearly down: park new
@@ -412,6 +462,8 @@ static bool deliver(modem_t *m, const char *peer, bool sender_is_phone,
                                     delivery_map_stage, &ctx);
     if (accepted) {
         __atomic_add_fetch(&s_forwarded_since_sweep, 1, __ATOMIC_RELAXED);
+        stats_bump(&s_stats.delivered);
+        stats_mark(&s_stats.last_delivered_ms);
         ESP_LOGI(TAG, "forwarded, msg_id=%s", mid);
         free(out);
         if (s_delivery_lock) xSemaphoreGive(s_delivery_lock);
@@ -488,6 +540,10 @@ static bool deliver_mms_notice(modem_t *m, const char *peer, time_t ts, const ch
                                    .message_id_size = sizeof(mid) };
     bool ok = sms_seen_deliver(&s_seen, fingerprint, delivery_send_stage,
                                delivery_map_stage, &ctx);
+    if (ok) {
+        stats_bump(&s_stats.delivered);
+        stats_mark(&s_stats.last_delivered_ms);
+    }
     xSemaphoreGive(s_delivery_lock);
     if (!ok || !info.content_location[0] ||
         (info.has_message_size && info.message_size_bytes > MMS_BODY_MAX)) return ok;
@@ -593,6 +649,7 @@ static int sms_process_index(modem_t *m, int idx)
         /* Empty SIM positions return CMS ERROR and are expected during an index sweep. */
         return -1;
     }
+    stats_bump(&s_stats.reads);
 
     bool ok = true;
     if (d.has_udh && d.concat_total > 1) {
@@ -612,6 +669,7 @@ static int sms_process_index(modem_t *m, int idx)
         delete_sim_entry(m, idx, identity);
         ESP_LOGW(TAG, "sms %d is safe in the spool; SIM slot released", idx);
     } else {
+        stats_bump(&s_stats.kept);
         ESP_LOGW(TAG, "keep sms %d for retry", idx);
     }
     return 0;
@@ -637,6 +695,15 @@ static uint64_t s_ring_start_ms[MODEM_COUNT];
 static time_t s_ring_start_epoch[MODEM_COUNT];
 static bool s_ring_time_synced[MODEM_COUNT];
 static QueueHandle_t s_ring_q;
+
+bool sms_call_active(void)
+{
+    bool active = false;
+    taskENTER_CRITICAL(&s_ring_mux);
+    for (int i = 0; i < MODEM_COUNT; ++i) active = active || s_ring_active[i];
+    taskEXIT_CRITICAL(&s_ring_mux);
+    return active;
+}
 
 static void ring_timeout(void *arg)
 {
@@ -770,6 +837,8 @@ void sms_urc(modem_t *m, const char *line)
         char *comma = strrchr(line, ',');
         if (comma) idx = atoi(comma + 1);
         if (idx >= 0) {
+            stats_bump(&s_stats.cmti);
+            stats_mark(&s_stats.last_cmti_ms);
             sms_job_t job = { .type = SMS_JOB_READ, .slot = m->idx, .idx = idx };
             if (xQueueSend(s_sms_q, &job, pdMS_TO_TICKS(100)) != pdTRUE) {
                 ESP_LOGW(TAG, "%s sms queue full", modem_name(m));
@@ -834,9 +903,14 @@ void sms_run(void)
                      sms_modem_configure(job.slot) == ESP_OK) &&
                     modem_cmd(&s_modems[job.slot], "AT+CPMS?", resp, sizeof(resp), 3000) == ESP_OK) {
                     const char *p = strstr(resp, "+CPMS:");
-                    int used, capacity;
-                    if (p && sscanf(p, "+CPMS: \"%*[^\"]\",%d,%d", &used, &capacity) == 2 &&
-                        used > 0 && used <= capacity && capacity <= 512) {
+                    int used = 0, capacity = 0;
+                    bool parsed = p && sscanf(p, "+CPMS: \"%*[^\"]\",%d,%d",
+                                              &used, &capacity) == 2;
+                    if (parsed) {
+                        stats_bump(&s_stats.scans);
+                        stats_sim_watermark(job.slot, (unsigned)used, (unsigned)capacity);
+                    }
+                    if (parsed && used > 0 && used <= capacity && capacity <= 512) {
                         /* Nearly full and holding unsaved events?  Make them durable
                          * now so the sweep below may release their SIM copies. */
                         if (used >= capacity - 1) ensure_pending_durable();

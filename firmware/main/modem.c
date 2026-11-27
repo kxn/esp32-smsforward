@@ -479,12 +479,12 @@ esp_err_t modem_sms_text(modem_t *m, const char *dest, const char *text,
     return result;
 }
 
-void modem_reset_hw(modem_t *m)
+esp_err_t modem_reset_hw(modem_t *m)
 {
     ESP_LOGW(TAG, "%s hardware reset", modem_name(m));
     if (xSemaphoreTake(m->lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
         ESP_LOGW(TAG, "%s reset skipped: modem busy", modem_name(m));
-        return;
+        return ESP_ERR_TIMEOUT;
     }
     gpio_set_level(m->pin.rst, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -509,6 +509,7 @@ void modem_reset_hw(modem_t *m)
     xSemaphoreTake(m->done, 0);
     xSemaphoreTake(m->prompt, 0);
     xSemaphoreGive(m->lock);
+    return ESP_OK;
 }
 
 bool modem_is_desynced(modem_t *m)

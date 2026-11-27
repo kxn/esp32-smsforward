@@ -90,6 +90,10 @@ esp_err_t cfg_init(void)
     int8_t tz = 8;
     nvs_get_i8(h, "tz", &tz);
     s_cfg.tz_offset = tz;
+    uint8_t modem_hours = 0;
+    if (nvs_get_u8(h, "mdm_rst_h", &modem_hours) == ESP_OK &&
+        modem_hours <= MODEM_RESET_HOURS_MAX)
+        s_cfg.modem_reset_hours = modem_hours;
     uint8_t setup = 0;
     if (nvs_get_u8(h, SETUP_KEY, &setup) == ESP_OK) atomic_store(&s_setup_done, setup == 1);
 
@@ -132,6 +136,7 @@ esp_err_t cfg_save(void)
     SET(nvs_set_str(h, "mark_url", s_cfg.mark_url));
     SET(nvs_set_str(h, "mark_key", s_cfg.mark_key));
     SET(nvs_set_u16(h, "mark_ms", s_cfg.mark_timeout_ms));
+    SET(nvs_set_u8(h, "mdm_rst_h", s_cfg.modem_reset_hours));
 
     err = nvs_commit(h);
 done:

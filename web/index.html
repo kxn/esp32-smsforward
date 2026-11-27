@@ -1231,6 +1231,70 @@
             </button>
           </div>
         </section>
+        <section class="panel" style="margin-top: 14px">
+          <h2 class="section-title">模组维护</h2>
+          <p class="view-sub">
+            概览页会显示每张卡的 AT、短信存储与通知配置探活结果。定时复位会避开通话和固件升级，每次只复位一张卡；0 表示关闭。
+          </p>
+          <div class="form-grid">
+            <div class="field">
+              <label for="mrhours">定时复位间隔（小时，0 关闭）</label
+              ><input
+                class="input"
+                id="mrhours"
+                type="number"
+                min="0"
+                max="168"
+                step="1"
+                value="0"
+              />
+            </div>
+          </div>
+          <div class="actions">
+            <button
+              class="button button-primary"
+              id="btnSaveMaint"
+              data-device-action
+              type="button"
+            >
+              保存复位设置
+            </button>
+            <button
+              class="button"
+              id="btnProbeModem"
+              data-device-action
+              type="button"
+            >
+              立即探活
+            </button>
+            <button
+              class="button"
+              id="btnScanSim"
+              data-device-action
+              type="button"
+            >
+              立即扫描 SIM
+            </button>
+          </div>
+          <div class="actions" style="margin-top: 10px">
+            <button
+              class="button button-danger"
+              id="btnResetM1"
+              data-device-action
+              type="button"
+            >
+              复位模组 1
+            </button>
+            <button
+              class="button button-danger"
+              id="btnResetM2"
+              data-device-action
+              type="button"
+            >
+              复位模组 2
+            </button>
+          </div>
+        </section>
         <section class="panel" id="firmwarePanel" style="margin-top: 14px" hidden>
           <h2 class="section-title">固件更新</h2>
           <p class="view-sub" id="firmwareVersion"></p>
@@ -1274,6 +1338,14 @@
       <form class="actions" id="factoryForm" method="dialog">
         <button class="button" type="submit" value="cancel" autofocus>取消</button>
         <button class="button button-danger" type="submit" value="confirm">确认恢复出厂</button>
+      </form>
+    </dialog>
+    <dialog class="factory-dialog" id="modemDialog" aria-labelledby="modemTitle" aria-describedby="modemDescription">
+      <h2 class="section-title" id="modemTitle">复位模组？</h2>
+      <p id="modemDescription">复位期间该卡会短暂离线并重新注册（约 20 秒），正在进行的通话不会被复位。确定继续？</p>
+      <form class="actions" id="modemForm" method="dialog">
+        <button class="button" type="submit" value="cancel" autofocus>取消</button>
+        <button class="button button-danger" type="submit" value="confirm">确认复位</button>
       </form>
     </dialog>
     <dialog class="factory-dialog" id="firmwareDialog" aria-labelledby="firmwareTitle" aria-describedby="firmwareDescription">
@@ -1325,6 +1397,7 @@
         feishu: ["appid", "appsecret"],
         slots: ["s1name", "s1num", "s2name", "s2num"],
         time: ["tz"],
+        maintenance: ["mrhours"],
         mark: ["markurl", "markkey", "markms"],
       };
       for (const [group, ids] of Object.entries(fields)) {
@@ -1350,6 +1423,9 @@
         const known = {
           url: "查询地址需以 http(s):// 开头且包含 {number}",
           key: "查询密钥过长",
+          hours: "定时复位需为 0 到 168 小时",
+          call_active: "有通话正在进行，请稍后再复位",
+          firmware_busy: "固件操作进行中，请稍后再试",
         };
         return known[msg] || msg || "设备操作失败";
       }
@@ -1839,6 +1915,20 @@
             })[c],
         );
       }
+      function ageText(ms) {
+        const sec = Math.max(0, Math.round(Number(ms) / 1000));
+        if (!Number.isFinite(sec)) return "时间未知";
+        if (sec < 60) return `${sec} 秒前`;
+        if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+        if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+        return `${Math.floor(sec / 86400)} 天前`;
+      }
+      const RESET_REASON = {
+        at: "AT 无响应",
+        sms: "短信路径假死",
+        manual: "手动",
+        scheduled: "定时维护",
+      };
       function sigLevel(csq) {
         if (!Number.isInteger(csq) || csq < 0) return 0;
         return csq === 0 ? 1 : csq < 10 ? 1 : csq < 17 ? 2 : csq < 24 ? 3 : 4;
@@ -1874,6 +1964,8 @@
           ["设备时间", "状态未知", "设备未连接"],
           ["上行网络", "状态未知", "设备未连接"],
           ["待补发", "状态未知", "设备未连接"],
+          ["短信收信", "状态未知", "设备未连接"],
+          ["模组探活", "状态未知", "设备未连接"],
         ]
           .map(
             ([k, v, d]) =>
@@ -2011,6 +2103,84 @@
             pending || dropped || spool.persist_failed || dedup ? "state-warn" : "state-good",
           ]);
         }
+        /* 短信收信计数回答"到底有没有收到"：cmti=0 且 reads=0 才是真的没来，
+         * reads>0 说明卡上有短信但没走通通知。 */
+        const smsStats = d.sms || {};
+        if (smsStats.cmti === undefined) {
+          items.push(["短信收信", "状态未知", "此版本无诊断数据", "state-warn"]);
+        } else {
+          const cmti = Number(smsStats.cmti || 0);
+          const reads = Number(smsStats.reads || 0);
+          const delivered = Number(smsStats.delivered || 0);
+          const kept = Number(smsStats.kept || 0);
+          const scans = Number(smsStats.scans || 0);
+          const lastCmt = smsStats.last_cmti_age_ms;
+          const lastText =
+            lastCmt === null || lastCmt === undefined
+              ? "本次启动未收到新短信"
+              : `最近新短信 ${ageText(lastCmt)}`;
+          const detail = `扫描 ${scans} 次 · 已转发 ${delivered} 条${kept ? ` · 留卡重试 ${kept} 次` : ""} · ${lastText}`;
+          items.push([
+            "短信收信",
+            cmti ? `新短信 ${cmti} 条` : reads ? `读取 ${reads} 条` : "未收到",
+            detail,
+            kept ? "state-warn" : "state-good",
+          ]);
+        }
+        const simUsed = Array.isArray(smsStats.sim_used) ? smsStats.sim_used : [];
+        const simCap = Array.isArray(smsStats.sim_capacity) ? smsStats.sim_capacity : [];
+        const simParts = [];
+        let simNearlyFull = false;
+        for (let i = 0; i < 2; i++) {
+          const cap = Number(simCap[i] || 0);
+          const used = Number(simUsed[i] || 0);
+          if (!cap) {
+            simParts.push(`卡${i + 1} 未知`);
+            continue;
+          }
+          if (used >= cap - 1) simNearlyFull = true;
+          simParts.push(`卡${i + 1} ${used}/${cap}${used >= cap - 1 ? "（将满）" : ""}`);
+        }
+        items.push([
+          "SIM 存储",
+          simCap.some((c) => Number(c) > 0)
+            ? simNearlyFull
+              ? "接近写满"
+              : "正常"
+            : "等待扫描",
+          simParts.join(" · "),
+          simNearlyFull ? "state-warn" : "state-good",
+        ]);
+        /* 每张卡单独一张探活卡：AT 正常不代表短信/URC 路径正常。 */
+        const modems = Array.isArray(d.modems) ? d.modems : [];
+        if (!modems.length) {
+          items.push(["模组探活", "状态未知", "此版本无诊断数据", "state-warn"]);
+        } else {
+          for (const m of modems) {
+            const n = Number(m.n || 0);
+            const probed = m.probe_age_ms !== null && m.probe_age_ms !== undefined;
+            const resetAge = Number(m.reset_age_ms);
+            const booting =
+              probed && !m.at_ok && Number(m.resets || 0) > 0 &&
+              Number.isFinite(resetAge) && resetAge >= 0 && resetAge < 25000;
+            const healthy = probed && m.at_ok && m.cpms_ok && m.cnmi_ok;
+            const value = !probed
+              ? "等待探活"
+              : booting
+                ? "复位重启中"
+                : !m.at_ok
+                  ? "AT 无响应"
+                  : !m.cpms_ok || !m.cnmi_ok
+                    ? "短信路径异常"
+                    : "正常";
+            const flags = `AT ${m.at_ok ? "✓" : "✗"} · 存储 ${m.cpms_ok ? "✓" : "✗"} · 通知 ${m.cnmi_ok ? "✓" : "✗"}`;
+            const fails = Number(m.at_fail || 0) + Number(m.sms_fail || 0);
+            const resets = Number(m.resets || 0);
+            const reason = m.reset_reason ? RESET_REASON[m.reset_reason] || m.reset_reason : "";
+            const detail = `${flags} · 探活 ${probed ? ageText(m.probe_age_ms) : "尚未"}${fails ? ` · 连续失败 ${fails}` : ""}${resets ? ` · 复位 ${resets} 次${reason ? `（最近：${reason}）` : ""}` : ""}${m.repairs ? ` · 重配 ${m.repairs} 次` : ""}`;
+            items.push([`模组 ${n}`, value, detail, healthy ? "state-good" : "state-warn"]);
+          }
+        }
         /* Only shown when the optional lookup is configured. */
         if (mark && mark.enabled) {
           const mQueries = Number(mark.queries || 0);
@@ -2060,6 +2230,9 @@
         }
         if (!drafts.has("time") && time.tz !== undefined && document.activeElement?.id !== "tz")
           $("tz").value = time.tz;
+        if (!drafts.has("maintenance") && d.modem_reset_hours !== undefined &&
+            document.activeElement?.id !== "mrhours")
+          $("mrhours").value = d.modem_reset_hours;
         if (!drafts.has("feishu") && document.activeElement?.id !== "appid")
           $("appid").value = fs.app_id || "";
         const mk = d.mark || {};
@@ -2267,6 +2440,88 @@
           }
         }),
       );
+      $("btnSaveMaint").addEventListener(
+        "click",
+        busy($("btnSaveMaint"), "正在保存…", async () => {
+          const version = drafts.get("maintenance");
+          const hours = Number($("mrhours").value);
+          if (!Number.isInteger(hours) || hours < 0 || hours > 168) {
+            toast("定时复位需为 0 到 168 小时", "bad");
+            return;
+          }
+          try {
+            const r = await rpc({ cmd: "modem_reset_set", hours });
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            saved("maintenance", version);
+            toast(hours ? `已设置每 ${hours} 小时维护复位` : "已关闭定时复位", "ok");
+            refresh(true);
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnProbeModem").addEventListener(
+        "click",
+        busy($("btnProbeModem"), "探活中…", async () => {
+          try {
+            const r = await rpc({ cmd: "modem_probe" });
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            toast("已请求探活，约 5 秒后刷新状态", "ok");
+            setTimeout(() => S.connected && refresh(true), 5000);
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      $("btnScanSim").addEventListener(
+        "click",
+        busy($("btnScanSim"), "扫描中…", async () => {
+          try {
+            const r = await rpc({ cmd: "sms_scan" });
+            if (!r.ok) {
+              toast(deviceError(r.err), "bad");
+              return;
+            }
+            toast("已请求扫描两张 SIM，约 4 秒后刷新状态", "ok");
+            setTimeout(() => S.connected && refresh(true), 4000);
+          } catch (e) {
+            errToast(e);
+          }
+        }),
+      );
+      let resetSlot = 0;
+      for (const [id, slot] of [["btnResetM1", 1], ["btnResetM2", 2]]) {
+        $(id).addEventListener("click", () => {
+          if (!S.connected || S.firmwarePhase) return;
+          resetSlot = slot;
+          $("modemTitle").textContent = `复位模组 ${slot}？`;
+          $("modemDialog").showModal();
+        });
+      }
+      $("modemForm").addEventListener("submit", async (event) => {
+        if (event.submitter?.value !== "confirm") return;
+        event.preventDefault();
+        if (!S.connected || S.firmwarePhase || !$("modemDialog").open) return;
+        const slot = resetSlot;
+        $("modemDialog").close();
+        try {
+          const r = await rpc({ cmd: "modem_reset", slot, confirm: true });
+          if (!r.ok) {
+            toast(deviceError(r.err), "bad");
+            return;
+          }
+          toast(`已请求复位模组 ${slot}，约 20 秒后重新探活`, "ok");
+          setTimeout(() => S.connected && refresh(true), 26000);
+        } catch (e) {
+          errToast(e);
+        }
+      });
       $("btnReboot").addEventListener(
         "click",
         busy($("btnReboot"), "正在重启…", async () => {

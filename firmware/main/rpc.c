@@ -10,6 +10,7 @@
 #include "device_status.h"
 #include "net_health.h"
 #include "sms.h"
+#include "health.h"
 #include "sms_spool.h"
 #include "peer_mark.h"
 #include "factory_reset.h"
@@ -23,6 +24,7 @@
 #include <time.h>
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
@@ -158,6 +160,27 @@ static cJSON *telemetry_data(void)
     return data;
 }
 
+static void add_age_ms(cJSON *object, const char *key, int64_t stamp_ms)
+{
+    if (stamp_ms <= 0) {
+        cJSON_AddNullToObject(object, key);
+        return;
+    }
+    int64_t age = esp_timer_get_time() / 1000 - stamp_ms;
+    cJSON_AddNumberToObject(object, key, (double)(age > 0 ? age : 0));
+}
+
+static const char *reset_reason_name(uint8_t reason)
+{
+    switch (reason) {
+    case MODEM_RESET_REASON_AT: return "at";
+    case MODEM_RESET_REASON_SMS: return "sms";
+    case MODEM_RESET_REASON_MANUAL: return "manual";
+    case MODEM_RESET_REASON_SCHEDULED: return "scheduled";
+    default: return "";
+    }
+}
+
 static cJSON *status_data(void)
 {
     const app_cfg_t *cfg = cfg_get();
@@ -215,7 +238,53 @@ static cJSON *status_data(void)
          * a crash); sweep_ms shows how far the idle SIM sweep has backed off. */
         cJSON_AddBoolToObject(sms, "journal_ok", sms_journal_ok());
         cJSON_AddNumberToObject(sms, "sweep_ms", (double)sms_sweep_delay_ms());
+        /* Counters separate "no SMS arrived" from "arrived but not forwarded",
+         * and the SIM watermark exposes a full card that would silently drop new
+         * messages.  All counters are since boot. */
+        sms_stats_t stats;
+        sms_get_stats(&stats);
+        cJSON_AddNumberToObject(sms, "cmti", stats.cmti);
+        cJSON_AddNumberToObject(sms, "reads", stats.reads);
+        cJSON_AddNumberToObject(sms, "delivered", stats.delivered);
+        cJSON_AddNumberToObject(sms, "kept", stats.kept);
+        cJSON_AddNumberToObject(sms, "deletes", stats.deletes);
+        cJSON_AddNumberToObject(sms, "scans", stats.scans);
+        add_age_ms(sms, "last_cmti_age_ms", stats.last_cmti_ms);
+        add_age_ms(sms, "last_delivered_age_ms", stats.last_delivered_ms);
+        cJSON *used = cJSON_AddArrayToObject(sms, "sim_used");
+        cJSON *cap = cJSON_AddArrayToObject(sms, "sim_capacity");
+        if (used && cap) {
+            for (int i = 0; i < 2; ++i) {
+                cJSON_AddItemToArray(used, cJSON_CreateNumber(stats.sim_used[i]));
+                cJSON_AddItemToArray(cap, cJSON_CreateNumber(stats.sim_capacity[i]));
+            }
+        }
     }
+    cJSON *modems = cJSON_AddArrayToObject(data, "modems");
+    if (modems) {
+        /* A bare AT probe cannot see a hung SMS/URC path; expose each layer and
+         * the reset history so "silent for hours" is diagnosable. */
+        for (int i = 0; i < 2; ++i) {
+            modem_health_status_t health;
+            health_get_status(i, &health);
+            cJSON *item = cJSON_CreateObject();
+            if (!item) { cJSON_Delete(data); return NULL; }
+            cJSON_AddNumberToObject(item, "n", i + 1);
+            cJSON_AddBoolToObject(item, "at_ok", health.at_ok);
+            cJSON_AddBoolToObject(item, "cpms_ok", health.cpms_ok);
+            cJSON_AddBoolToObject(item, "cnmi_ok", health.cnmi_ok);
+            cJSON_AddNumberToObject(item, "probes", health.probes);
+            cJSON_AddNumberToObject(item, "at_fail", health.at_fail_streak);
+            cJSON_AddNumberToObject(item, "sms_fail", health.sms_fail_streak);
+            cJSON_AddNumberToObject(item, "resets", health.resets);
+            cJSON_AddNumberToObject(item, "repairs", health.repairs);
+            add_age_ms(item, "probe_age_ms", health.last_probe_ms);
+            add_age_ms(item, "reset_age_ms", health.last_reset_ms);
+            cJSON_AddStringToObject(item, "reset_reason", reset_reason_name(health.last_reset_reason));
+            cJSON_AddItemToArray(modems, item);
+        }
+    }
+    cJSON_AddNumberToObject(data, "modem_reset_hours", cfg->modem_reset_hours);
     cJSON *mark = cJSON_AddObjectToObject(data, "mark");
     if (mark) {
         /* The key itself is never echoed back; enabled only reports whether a
@@ -500,6 +569,37 @@ esp_err_t rpc_dispatch_json(const char *request, char *response, size_t response
                 cJSON_AddNumberToObject(data, "ms", peer_mark_last_ms());
                 cJSON_AddNumberToObject(data, "bytes", peer_mark_last_bytes());
             }
+        }
+    } else if (!strcmp(cmd, "sms_scan")) {
+        /* Run the SIM sweep now instead of waiting for the backoff timer. */
+        sms_sweep_now();
+        data = cJSON_CreateObject();
+        if (!data) err = "memory";
+        else cJSON_AddBoolToObject(data, "queued", true);
+    } else if (!strcmp(cmd, "modem_probe")) {
+        health_request_probe();
+        data = cJSON_CreateObject();
+        if (!data) err = "memory";
+        else cJSON_AddBoolToObject(data, "queued", true);
+    } else if (!strcmp(cmd, "modem_reset")) {
+        int slot = 0;
+        if (!exact_integer(cJSON_GetObjectItemCaseSensitive(root, "slot"), 1, 2, &slot)) err = "slot";
+        else if (!explicit_reset_confirmation(root)) err = "confirm_required";
+        else if (firmware_busy()) err = "firmware_busy";
+        else if (!health_request_reset(slot - 1)) err = "call_active";
+        else {
+            data = cJSON_CreateObject();
+            if (!data) err = "memory";
+            else cJSON_AddNumberToObject(data, "slot", slot);
+        }
+    } else if (!strcmp(cmd, "modem_reset_set")) {
+        int hours = 0;
+        if (!exact_integer(cJSON_GetObjectItemCaseSensitive(root, "hours"), 0,
+                           MODEM_RESET_HOURS_MAX, &hours)) err = "hours";
+        else {
+            uint8_t old = cfg_get()->modem_reset_hours;
+            cfg_mut()->modem_reset_hours = (uint8_t)hours;
+            if (cfg_save() != ESP_OK) { cfg_mut()->modem_reset_hours = old; err = "save_failed"; }
         }
     } else if (!strcmp(cmd, "reboot")) {
         if (!firmware_restart_reserve()) err = "firmware_busy";

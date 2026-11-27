@@ -129,7 +129,7 @@ BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticks)
     }
     /* Run reset at the point where RX would sleep on a silent UART. */
     assert(g_rx_offset == sizeof(g_rx_data) && g_urc_count == 1);
-    modem_reset_hw(&g_modem);
+    (void)modem_reset_hw(&g_modem);
     assert(g_flush_count == 1 && !modem_is_desynced(&g_modem));
     assert(modem_cmd(&g_modem, "AT+CEREG?", NULL, 0, 10) == ESP_OK);
     longjmp(g_rx_task_exit, 1);

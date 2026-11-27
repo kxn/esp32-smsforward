@@ -514,9 +514,9 @@ static void handle_line(char *line)
     } else if (!strncmp(line, "pdusub ", 7)) {
         cmd_pdusub(line + 7);
     } else if (!strcmp(line, "r1")) {
-        modem_reset_hw(&s_modems[0]);
+        (void)modem_reset_hw(&s_modems[0]);
     } else if (!strcmp(line, "r2")) {
-        modem_reset_hw(&s_modems[1]);
+        (void)modem_reset_hw(&s_modems[1]);
     } else {
         printf("?\n");
     }

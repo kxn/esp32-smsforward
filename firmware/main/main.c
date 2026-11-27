@@ -242,7 +242,7 @@ static void modems_boot_task(void *arg)
     }
     /* Reset the modules once after power-up; otherwise SIM detection may stall. */
     for (int i = 0; i < MODEM_COUNT; i++) {
-        modem_reset_hw(&s_modems[i]);
+        (void)modem_reset_hw(&s_modems[i]);
     }
     vTaskDelay(pdMS_TO_TICKS(12000));
 
